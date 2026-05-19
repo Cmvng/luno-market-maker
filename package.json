@@ -1,0 +1,16 @@
+{
+  "name": "luno-market-maker",
+  "version": "1.0.0",
+  "description": "USDT/NGN and BTC/NGN market making bot for Luno Nigeria",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
