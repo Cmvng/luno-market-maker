@@ -80,10 +80,26 @@ async function selectBestPair() {
 async function updateBalances() {
   try {
     const res = await luno.getBalances();
-    for (const acc of res.balance) {
-      if (acc.asset === 'NGN') state.ngnBalance = parseFloat(acc.balance) - parseFloat(acc.reserved);
-      if (acc.asset === 'USDT') state.usdtBalance = parseFloat(acc.balance) - parseFloat(acc.reserved);
-      if (acc.asset === 'XBT') state.btcBalance = parseFloat(acc.balance) - parseFloat(acc.reserved);
+    
+    // Debug: log raw response structure on first call
+    if (state.dailyRotations === 0 && state.ngnBalance === 0) {
+      log(`DEBUG balance response keys: ${JSON.stringify(Object.keys(res))}`);
+      if (res.balance && res.balance.length > 0) {
+        log(`DEBUG first account: ${JSON.stringify(res.balance[0])}`);
+      }
+    }
+    
+    const accounts = res.balance || [];
+    for (const acc of accounts) {
+      // Luno API may use 'asset' or 'currency' depending on version
+      const currency = acc.asset || acc.currency || '';
+      const bal = parseFloat(acc.balance || 0);
+      const reserved = parseFloat(acc.reserved || 0);
+      const available = bal - reserved;
+      
+      if (currency === 'NGN') state.ngnBalance = available;
+      if (currency === 'USDT') state.usdtBalance = available;
+      if (currency === 'XBT') state.btcBalance = available;
     }
     log(`Balances — NGN: ₦${state.ngnBalance.toFixed(2)} | USDT: ${state.usdtBalance.toFixed(4)} | BTC: ${state.btcBalance.toFixed(8)}`);
   } catch (err) {
