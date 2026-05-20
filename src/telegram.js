@@ -1,5 +1,5 @@
 // src/telegram.js — Telegram Bot Alerts
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+// Using Node 18+ built-in fetch
 
 class TelegramBot {
   constructor(token, chatId) {
