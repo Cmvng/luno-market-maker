@@ -194,29 +194,37 @@ async function placeOrders(spread) {
 
   // === ALWAYS HAVE ORDERS ON THE BOOK ===
 
-  // Price: one tick better than best bid/ask
-  let buyPrice = spread.bestBid + tick;
-  let sellPrice = spread.bestAsk - tick;
+  // Price calculation
+  let buyPrice, sellPrice;
+
+  if (spread.spreadNgn < tick * 3) {
+    // Spread is extremely tight or zero — just place at best bid and best ask
+    // Don't try to improve, just be in the queue
+    buyPrice = spread.bestBid;
+    sellPrice = spread.bestAsk;
+  } else {
+    // Normal spread — try to be one tick better
+    buyPrice = spread.bestBid + tick;
+    sellPrice = spread.bestAsk - tick;
+  }
 
   // === SMART SELL: if we bought cheap, undercut everyone ===
-  // If our last buy filled below the current best bid, we can sell at
-  // just above our buy price — guaranteed profit, impossible to undercut
   if (state.lastBuyFillPrice && state.lastBuyFillPrice > 0 && isUsdt) {
     const minProfitSell = Math.ceil((state.lastBuyFillPrice + 0.10) * 100) / 100;
     if (minProfitSell < sellPrice && minProfitSell < spread.bestAsk) {
       sellPrice = minProfitSell;
-      log(`💡 Smart sell: cost ₦${state.lastBuyFillPrice}, selling @ ₦${sellPrice}`);
     }
   }
 
-  // Never cross mid
-  if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
-  if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
-
-  // If buy and sell would cross each other, spread evenly from mid
+  // Safety: sell must be above buy
   if (sellPrice <= buyPrice) {
-    buyPrice = spread.midPrice - tick;
-    sellPrice = spread.midPrice + tick;
+    buyPrice = spread.bestBid;
+    sellPrice = spread.bestAsk;
+    // If still crossing (spread truly zero), offset from mid
+    if (sellPrice <= buyPrice) {
+      buyPrice = spread.midPrice - tick;
+      sellPrice = spread.midPrice + tick;
+    }
   }
 
   // === CAUTION MODE ===
