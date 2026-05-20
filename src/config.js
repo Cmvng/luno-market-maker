@@ -46,7 +46,7 @@ module.exports = {
   MAX_ORDER_USDT: 50,               // max single order in USDT
   MIN_ORDER_USDT: 5,                // min order size
   MAX_ORDER_BTC: 0.005,             // max single order in BTC
-  MIN_ORDER_BTC: 0.0001,            // min order size
+  MIN_ORDER_BTC: 0.0005,            // min order size (Luno minimum ~0.0005 BTC)
 
   // === TOP OF BOOK ===
   PRICE_TICK_USDT: 0.0001,          // minimum price increment for USDT/NGN
