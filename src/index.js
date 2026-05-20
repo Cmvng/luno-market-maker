@@ -233,25 +233,27 @@ async function placeOrders(spread) {
   }
 
   // === CALCULATE ORDER SIZE ===
+  // Use only 50% of available balance per side to keep both sides funded
   let buyVolume, sellVolume;
+  const CAPITAL_PER_SIDE = 0.48; // use 48% of available (leaves room for rounding)
 
   if (isUsdt) {
     // Buy side: how much USDT can we buy with available NGN?
-    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 100) / 100; // 2 decimal places
+    buyVolume = Math.floor((state.ngnBalance * CAPITAL_PER_SIDE / buyPrice) * 100) / 100;
     buyVolume = Math.min(buyVolume, config.MAX_ORDER_USDT);
     buyVolume = Math.max(buyVolume, 0);
 
     // Sell side: how much USDT do we have?
-    sellVolume = Math.floor(state.usdtBalance * 0.95 * 100) / 100; // 2 decimal places
+    sellVolume = Math.floor(state.usdtBalance * CAPITAL_PER_SIDE * 100) / 100;
     sellVolume = Math.min(sellVolume, config.MAX_ORDER_USDT);
     sellVolume = Math.max(sellVolume, 0);
   } else {
     // BTC — 6 decimal places for volume
-    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 1000000) / 1000000;
+    buyVolume = Math.floor((state.ngnBalance * CAPITAL_PER_SIDE / buyPrice) * 1000000) / 1000000;
     buyVolume = Math.min(buyVolume, config.MAX_ORDER_BTC);
     buyVolume = Math.max(buyVolume, 0);
 
-    sellVolume = Math.floor(state.btcBalance * 0.95 * 1000000) / 1000000;
+    sellVolume = Math.floor(state.btcBalance * CAPITAL_PER_SIDE * 1000000) / 1000000;
     sellVolume = Math.min(sellVolume, config.MAX_ORDER_BTC);
     sellVolume = Math.max(sellVolume, 0);
   }
@@ -324,6 +326,30 @@ async function mainLoop() {
   await telegram.startup();
   log('🚀 Bot starting...');
   log(`Primary pair: ${config.PRIMARY_PAIR} | Secondary: ${config.SECONDARY_PAIR}`);
+
+  // Cancel any leftover orders from previous run
+  log('Cancelling any leftover orders from previous run...');
+  try {
+    const usdtOrders = await luno.listOrders('USDTNGN', 'PENDING');
+    if (usdtOrders.orders) {
+      for (const order of usdtOrders.orders) {
+        await luno.cancelOrder(order.order_id);
+        log(`Cancelled leftover USDT order: ${order.order_id}`);
+      }
+    }
+    const btcOrders = await luno.listOrders('XBTNGN', 'PENDING');
+    if (btcOrders.orders) {
+      for (const order of btcOrders.orders) {
+        await luno.cancelOrder(order.order_id);
+        log(`Cancelled leftover BTC order: ${order.order_id}`);
+      }
+    }
+  } catch (err) {
+    log(`Warning: Could not cancel leftover orders: ${err.message}`);
+  }
+
+  // Wait for orders to settle
+  await sleep(2000);
 
   // Initial balance fetch
   await updateBalances();
