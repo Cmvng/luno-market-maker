@@ -464,6 +464,47 @@ async function mainLoop() {
       if (state._balanceCounter >= 5 || !state.buyOrderId || !state.sellOrderId) {
         await updateBalances();
         state._balanceCounter = 0;
+
+        // === AUTO-REBALANCE: when heavy on one side, use BIGGER orders on that side ===
+        const invRatio = state.getInventoryRatio();
+        
+        if (invRatio > 0.70) {
+          // Heavy on USDT — make sell orders BIGGER and more aggressive
+          // Cancel current sell and place a larger one at top of ask
+          if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
+            try { await luno.cancelOrder(state.sellOrderId); } catch(e) {}
+            state.sellOrderId = null;
+          }
+          // Use 80% of USDT balance for the sell (not 48%)
+          const bigSellVol = Math.floor(state.usdtBalance * 0.80 * 100) / 100;
+          const sellPrice = Math.ceil((spread.bestAsk - 0.01) * 100) / 100;
+          if (bigSellVol >= 5) {
+            try {
+              const res = await luno.createOrder('USDTNGN', 'ASK', bigSellVol, sellPrice, true);
+              state.sellOrderId = res.order_id;
+              state.sellOrderPrice = sellPrice;
+              state.sellOrderVolume = bigSellVol;
+              log(`⚡ BIG SELL ${bigSellVol} @ ₦${sellPrice} (inv ${(invRatio*100).toFixed(0)}%)`);
+            } catch(err) {}
+          }
+        } else if (invRatio < 0.30) {
+          // Heavy on NGN — make buy orders BIGGER and more aggressive
+          if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
+            try { await luno.cancelOrder(state.buyOrderId); } catch(e) {}
+            state.buyOrderId = null;
+          }
+          const bigBuyVol = Math.floor((state.ngnBalance * 0.80 / (spread.bestBid + 0.01)) * 100) / 100;
+          const buyPrice = Math.floor((spread.bestBid + 0.01) * 100) / 100;
+          if (bigBuyVol >= 5) {
+            try {
+              const res = await luno.createOrder('USDTNGN', 'BID', bigBuyVol, buyPrice, true);
+              state.buyOrderId = res.order_id;
+              state.buyOrderPrice = buyPrice;
+              state.buyOrderVolume = bigBuyVol;
+              log(`⚡ BIG BUY ${bigBuyVol} @ ₦${buyPrice} (inv ${(invRatio*100).toFixed(0)}%)`);
+            } catch(err) {}
+          }
+        }
       }
 
       // === REFRESH ORDERS TO STAY ON TOP ===
