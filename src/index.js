@@ -181,45 +181,29 @@ async function placeOrders(spread) {
   const pair = state.activePair;
   const isUsdt = pair === 'USDTNGN';
   const tick = isUsdt ? config.PRICE_TICK_USDT : config.PRICE_TICK_BTC;
-  const minSpread = isUsdt ? config.USDT_MIN_SPREAD_NGN : spread.midPrice * config.BTC_MIN_SPREAD_PCT / 100;
 
-  // === COMPETITOR-AWARE PRICING ===
-  // Based on observed patterns:
-  // - Other bot's ask floor: ~1386.40 (they won't sell below this)
-  // - Other bot's bid ceiling: ~1386.10 (they won't buy above this)
-  // - Other bot undercuts by 0.16 per cycle until they hit floor
-  //
-  // STRATEGY: Place our orders at THEIR limits
-  // - Our sell sits at their floor — they chase down to us, we're already there
-  // - Our buy sits at their ceiling — we catch fills at the best price they'll allow
+  // === ALWAYS HAVE ORDERS ON THE BOOK ===
+  // No minimum spread gate. If spread is tight, use smaller size.
+  // If a whale sweeps, our order catches it.
 
-  // Dynamic pricing: use order book but with competitor floor/ceiling awareness
+  // Price: one tick better than best bid/ask
   let buyPrice = spread.bestBid + tick;
   let sellPrice = spread.bestAsk - tick;
 
-  // Don't cross mid
+  // Never cross mid
   if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
   if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
 
-  // === KEY INSIGHT: Don't chase below competitor floor ===
-  // If our sell would go below 1386.40, stay at 1386.40
-  // The other bot will come to us
-  if (isUsdt) {
-    const COMPETITOR_ASK_FLOOR = spread.midPrice - (spread.spreadNgn * 0.15);
-    if (sellPrice < COMPETITOR_ASK_FLOOR) sellPrice = COMPETITOR_ASK_FLOOR;
-    
-    // On buy side, be aggressive up to near mid but not past it
-    const COMPETITOR_BID_CEILING = spread.midPrice + (spread.spreadNgn * 0.15);
-    if (buyPrice > COMPETITOR_BID_CEILING) buyPrice = COMPETITOR_BID_CEILING;
+  // If buy and sell would cross each other, spread evenly from mid
+  if (sellPrice <= buyPrice) {
+    buyPrice = spread.midPrice - tick;
+    sellPrice = spread.midPrice + tick;
   }
-
-  // Safety: maintain minimum spread between our buy and sell
-  if (sellPrice - buyPrice < minSpread * 0.8) return;
 
   // === CAUTION MODE ===
   if (state.state === 'CAUTION') {
-    buyPrice -= isUsdt ? 1.5 : spread.midPrice * 0.003;
-    sellPrice += isUsdt ? 1.5 : spread.midPrice * 0.003;
+    buyPrice -= isUsdt ? 1.0 : spread.midPrice * 0.002;
+    sellPrice += isUsdt ? 1.0 : spread.midPrice * 0.002;
   }
 
   // === ROUND ===
@@ -231,29 +215,34 @@ async function placeOrders(spread) {
     sellPrice = Math.ceil(sellPrice);
   }
 
-  // === ORDER SIZE ===
-  const CAP = 0.48;
+  // === ORDER SIZE — scale with spread ===
+  // Tight spread = smaller orders (less risk)
+  // Wide spread = bigger orders (more profit per fill)
+  const spreadRatio = Math.min(spread.spreadNgn / 2.0, 1.0); // 0 to 1 scale
+  const baseCap = 0.48;
+  const dynamicCap = Math.max(0.15, baseCap * spreadRatio); // minimum 15% even at tight spreads
+
   let buyVolume, sellVolume;
   if (isUsdt) {
-    buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 100) / 100;
-    sellVolume = Math.floor(state.usdtBalance * CAP * 100) / 100;
+    buyVolume = Math.floor((state.ngnBalance * dynamicCap / buyPrice) * 100) / 100;
+    sellVolume = Math.floor(state.usdtBalance * dynamicCap * 100) / 100;
     buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_USDT);
     sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_USDT);
   } else {
-    buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 1000000) / 1000000;
-    sellVolume = Math.floor(state.btcBalance * CAP * 1000000) / 1000000;
+    buyVolume = Math.floor((state.ngnBalance * dynamicCap / buyPrice) * 1000000) / 1000000;
+    sellVolume = Math.floor(state.btcBalance * dynamicCap * 1000000) / 1000000;
     buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_BTC);
     sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_BTC);
   }
   const minVol = isUsdt ? config.MIN_ORDER_USDT : config.MIN_ORDER_BTC;
 
-  // === INVENTORY PROTECTION ===
-  const invRatio = state.getInventoryRatio();
-  const skipBuy = invRatio > config.IMBALANCE_CRITICAL_RATIO;
-  const skipSell = invRatio < (1 - config.IMBALANCE_CRITICAL_RATIO);
+  // === NO INVENTORY BLOCK — always place both sides ===
+  // Even at 90% crypto, still place a sell to rebalance
+  // Even at 90% NGN, still place a buy
+  // Just skip the side that has zero balance
 
   // === PLACE BUY ===
-  if (!state.buyOrderId && buyVolume >= minVol && !skipBuy) {
+  if (!state.buyOrderId && buyVolume >= minVol) {
     try {
       const res = await luno.createOrder(pair, 'BID', buyVolume, buyPrice, true);
       state.buyOrderId = res.order_id;
@@ -264,9 +253,9 @@ async function placeOrders(spread) {
     } catch (err) {
       if (err.message.includes('ErrOrderCanceled')) {
         state._buyFails = (state._buyFails || 0) + 1;
-        if (state._buyFails >= 3) {
+        if (state._buyFails >= 5) {
           state.buyOrderId = 'COOLDOWN';
-          setTimeout(() => { state.buyOrderId = null; }, 10000);
+          setTimeout(() => { state.buyOrderId = null; }, 5000);
           state._buyFails = 0;
         }
       } else {
@@ -276,7 +265,7 @@ async function placeOrders(spread) {
   }
 
   // === PLACE SELL ===
-  if (!state.sellOrderId && sellVolume >= minVol && !skipSell) {
+  if (!state.sellOrderId && sellVolume >= minVol) {
     try {
       const res = await luno.createOrder(pair, 'ASK', sellVolume, sellPrice, true);
       state.sellOrderId = res.order_id;
@@ -287,9 +276,9 @@ async function placeOrders(spread) {
     } catch (err) {
       if (err.message.includes('ErrOrderCanceled')) {
         state._sellFails = (state._sellFails || 0) + 1;
-        if (state._sellFails >= 3) {
+        if (state._sellFails >= 5) {
           state.sellOrderId = 'COOLDOWN';
-          setTimeout(() => { state.sellOrderId = null; }, 10000);
+          setTimeout(() => { state.sellOrderId = null; }, 5000);
           state._sellFails = 0;
         }
       } else {
