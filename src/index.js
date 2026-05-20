@@ -262,9 +262,19 @@ async function placeOrders(spread) {
       state.buyOrderId = res.order_id;
       state.buyOrderPrice = buyPrice;
       state.buyOrderVolume = buyVolume;
+      state._buyFails = 0;
       log(`📗 BUY ${buyVolume} @ ₦${buyPrice}`);
     } catch (err) {
-      if (!err.message.includes('ErrOrderCanceled')) state.consecutiveErrors++;
+      if (err.message.includes('ErrOrderCanceled')) {
+        state._buyFails = (state._buyFails || 0) + 1;
+        if (state._buyFails >= 3) {
+          state.buyOrderId = 'COOLDOWN';
+          setTimeout(() => { state.buyOrderId = null; }, 10000);
+          state._buyFails = 0;
+        }
+      } else {
+        state.consecutiveErrors++;
+      }
     }
   }
 
@@ -275,9 +285,20 @@ async function placeOrders(spread) {
       state.sellOrderId = res.order_id;
       state.sellOrderPrice = sellPrice;
       state.sellOrderVolume = sellVolume;
+      state._sellFails = 0;
       log(`📕 SELL ${sellVolume} @ ₦${sellPrice}`);
     } catch (err) {
-      if (!err.message.includes('ErrOrderCanceled')) state.consecutiveErrors++;
+      if (err.message.includes('ErrOrderCanceled')) {
+        state._sellFails = (state._sellFails || 0) + 1;
+        if (state._sellFails >= 3) {
+          // 3 post-only fails = cooldown 10 seconds
+          state.sellOrderId = 'COOLDOWN';
+          setTimeout(() => { state.sellOrderId = null; }, 10000);
+          state._sellFails = 0;
+        }
+      } else {
+        state.consecutiveErrors++;
+      }
     }
   }
 }
@@ -292,22 +313,32 @@ async function refreshOrders(spread) {
 
   const idealBuy = spread.bestBid + tick;
   const idealSell = spread.bestAsk - tick;
+  const minSpread = isUsdt ? config.USDT_MIN_SPREAD_NGN : spread.midPrice * config.BTC_MIN_SPREAD_PCT / 100;
 
-  // BUY SIDE: aggressive — stay on top of bid
-  if (state.buyOrderId && state.buyOrderPrice < idealBuy - tick) {
+  // Don't refresh if spread is too tight — both sides stay cancelled
+  if (spread.spreadNgn < minSpread) return;
+
+  // Safety: our buy and sell must maintain minimum distance
+  if (idealSell - idealBuy < minSpread) return;
+
+  // BUY SIDE: aggressive — if we're not top bid, refresh
+  if (state.buyOrderId && state.buyOrderPrice < idealBuy - 0.005) {
     try {
       await luno.cancelOrder(state.buyOrderId);
       state.buyOrderId = null;
     } catch (err) { state.buyOrderId = null; }
   }
 
-  // SELL SIDE: PATIENT — only refresh if price moved more than 0.5 NGN
-  // Don't chase the other bot tick by tick on the sell side
-  if (state.sellOrderId && Math.abs(state.sellOrderPrice - idealSell) > 0.50) {
-    try {
-      await luno.cancelOrder(state.sellOrderId);
-      state.sellOrderId = null;
-    } catch (err) { state.sellOrderId = null; }
+  // SELL SIDE: aggressive — if we're not top ask, refresh
+  // But only if our new sell price would still be ABOVE our buy price by minSpread
+  if (state.sellOrderId && state.sellOrderPrice > idealSell + 0.005) {
+    const newSellWouldBeProfit = idealSell > (state.buyOrderPrice || idealBuy - tick) + minSpread * 0.5;
+    if (newSellWouldBeProfit) {
+      try {
+        await luno.cancelOrder(state.sellOrderId);
+        state.sellOrderId = null;
+      } catch (err) { state.sellOrderId = null; }
+    }
   }
 }
 
