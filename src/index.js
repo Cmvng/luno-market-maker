@@ -260,33 +260,40 @@ async function placeOrders(spread) {
 
   const minVol = isUsdt ? config.MIN_ORDER_USDT : config.MIN_ORDER_BTC;
 
+  // === INVENTORY PROTECTION: don't buy more if already overloaded ===
+  const invRatio = state.getInventoryRatio();
+  const skipBuy = invRatio > config.IMBALANCE_CRITICAL_RATIO;   // too much crypto, stop buying
+  const skipSell = invRatio < (1 - config.IMBALANCE_CRITICAL_RATIO); // too much NGN, stop selling
+
   // === PLACE BUY ORDER ===
-  if (!state.buyOrderId && buyVolume >= minVol) {
+  if (!state.buyOrderId && buyVolume >= minVol && !skipBuy) {
     try {
-      log(`DEBUG placing buy: pair=${pair} type=BID vol=${buyVolume} price=${buyPrice}`);
       const res = await luno.createOrder(pair, 'BID', buyVolume, buyPrice, true);
       state.buyOrderId = res.order_id;
       state.buyOrderPrice = buyPrice;
       state.buyOrderVolume = buyVolume;
-      log(`📗 BUY placed: ${buyVolume} @ ₦${buyPrice} [${res.order_id}]`);
+      log(`📗 BUY ${buyVolume} @ ₦${buyPrice} [${res.order_id}]`);
     } catch (err) {
-      log(`Failed to place buy: ${err.message} (vol=${buyVolume} price=${buyPrice})`);
-      state.consecutiveErrors++;
+      if (!err.message.includes('ErrOrderCanceled')) {
+        log(`Failed buy: ${err.message} (vol=${buyVolume} price=${buyPrice})`);
+        state.consecutiveErrors++;
+      }
     }
   }
 
   // === PLACE SELL ORDER ===
-  if (!state.sellOrderId && sellVolume >= minVol) {
+  if (!state.sellOrderId && sellVolume >= minVol && !skipSell) {
     try {
-      log(`DEBUG placing sell: pair=${pair} type=ASK vol=${sellVolume} price=${sellPrice}`);
       const res = await luno.createOrder(pair, 'ASK', sellVolume, sellPrice, true);
       state.sellOrderId = res.order_id;
       state.sellOrderPrice = sellPrice;
       state.sellOrderVolume = sellVolume;
-      log(`📕 SELL placed: ${sellVolume} @ ₦${sellPrice} [${res.order_id}]`);
+      log(`📕 SELL ${sellVolume} @ ₦${sellPrice} [${res.order_id}]`);
     } catch (err) {
-      log(`Failed to place sell: ${err.message} (vol=${sellVolume} price=${sellPrice})`);
-      state.consecutiveErrors++;
+      if (!err.message.includes('ErrOrderCanceled')) {
+        log(`Failed sell: ${err.message} (vol=${sellVolume} price=${sellPrice})`);
+        state.consecutiveErrors++;
+      }
     }
   }
 }
@@ -301,21 +308,19 @@ async function refreshOrders(spread) {
   const idealBuy = spread.bestBid + tick;
   const idealSell = spread.bestAsk - tick;
 
-  // If our buy is no longer at the top, cancel and replace
-  if (state.buyOrderId && Math.abs(state.buyOrderPrice - idealBuy) > tick * 2) {
+  // AGGRESSIVE: cancel and replace if we're NOT exactly at top of book
+  // Any deviation = instant refresh
+  if (state.buyOrderId && state.buyOrderPrice < idealBuy - 0.001) {
     try {
       await luno.cancelOrder(state.buyOrderId);
       state.buyOrderId = null;
-      log(`Refreshing buy order — was ₦${state.buyOrderPrice}, ideal is ₦${idealBuy}`);
     } catch (err) { state.buyOrderId = null; }
   }
 
-  // Same for sell
-  if (state.sellOrderId && Math.abs(state.sellOrderPrice - idealSell) > tick * 2) {
+  if (state.sellOrderId && state.sellOrderPrice > idealSell + 0.001) {
     try {
       await luno.cancelOrder(state.sellOrderId);
       state.sellOrderId = null;
-      log(`Refreshing sell order — was ₦${state.sellOrderPrice}, ideal is ₦${idealSell}`);
     } catch (err) { state.sellOrderId = null; }
   }
 }
@@ -452,9 +457,12 @@ async function mainLoop() {
       // === CHECK FOR FILLS ===
       await checkOrderFills();
 
-      // === UPDATE BALANCES (every few cycles) ===
-      if (state.dailyRotations % 3 === 0 || !state.buyOrderId || !state.sellOrderId) {
+      // === UPDATE BALANCES (every 5 seconds at 1s loop speed) ===
+      if (!state._balanceCounter) state._balanceCounter = 0;
+      state._balanceCounter++;
+      if (state._balanceCounter >= 5 || !state.buyOrderId || !state.sellOrderId) {
         await updateBalances();
+        state._balanceCounter = 0;
       }
 
       // === REFRESH ORDERS TO STAY ON TOP ===
@@ -463,14 +471,17 @@ async function mainLoop() {
       // === PLACE NEW ORDERS IF NEEDED ===
       await placeOrders(spread);
 
-      // === LOG STATUS ===
-      log(
-        `${state.state} | ${state.activePair} | ` +
-        `Spread: ₦${spread.spreadNgn.toFixed(4)} (${spread.spreadPct.toFixed(3)}%) | ` +
-        `Inv: ${(state.getInventoryRatio() * 100).toFixed(0)}% crypto | ` +
-        `P&L: ₦${state.dailyPnl.toFixed(2)} | ` +
-        `Rot: ${state.dailyRotations}`
-      );
+      // === LOG STATUS (every 10 seconds to reduce noise) ===
+      if (Date.now() % 10000 < config.LOOP_INTERVAL_MS) {
+        log(
+          `${state.state} | ${state.activePair} | ` +
+          `Spread: ₦${spread.spreadNgn.toFixed(2)} | ` +
+          `Inv: ${(state.getInventoryRatio() * 100).toFixed(0)}% | ` +
+          `P&L: ₦${state.dailyPnl.toFixed(2)} | ` +
+          `Rot: ${state.dailyRotations} | ` +
+          `Buy: ${state.buyOrderId ? '✅' : '❌'} Sell: ${state.sellOrderId ? '✅' : '❌'}`
+        );
+      }
 
     } catch (err) {
       log(`❌ Loop error: ${err.message}`);
