@@ -223,12 +223,13 @@ async function placeOrders(spread) {
   }
 
   // Round prices appropriately
+  // Luno USDT/NGN accepts 2 decimal places for price and volume
   if (isUsdt) {
-    buyPrice = Math.round(buyPrice * 10000) / 10000;
-    sellPrice = Math.round(sellPrice * 10000) / 10000;
+    buyPrice = Math.floor(buyPrice * 100) / 100;    // round DOWN for buy
+    sellPrice = Math.ceil(sellPrice * 100) / 100;    // round UP for sell
   } else {
-    buyPrice = Math.round(buyPrice);
-    sellPrice = Math.round(sellPrice);
+    buyPrice = Math.floor(buyPrice);                  // whole numbers for BTC/NGN
+    sellPrice = Math.ceil(sellPrice);
   }
 
   // === CALCULATE ORDER SIZE ===
@@ -236,21 +237,21 @@ async function placeOrders(spread) {
 
   if (isUsdt) {
     // Buy side: how much USDT can we buy with available NGN?
-    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 10000) / 10000; // use 95% of available
+    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 100) / 100; // 2 decimal places
     buyVolume = Math.min(buyVolume, config.MAX_ORDER_USDT);
     buyVolume = Math.max(buyVolume, 0);
 
     // Sell side: how much USDT do we have?
-    sellVolume = Math.floor(state.usdtBalance * 0.95 * 10000) / 10000;
+    sellVolume = Math.floor(state.usdtBalance * 0.95 * 100) / 100; // 2 decimal places
     sellVolume = Math.min(sellVolume, config.MAX_ORDER_USDT);
     sellVolume = Math.max(sellVolume, 0);
   } else {
-    // BTC
-    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 100000000) / 100000000;
+    // BTC — 6 decimal places for volume
+    buyVolume = Math.floor((state.ngnBalance * 0.95 / buyPrice) * 1000000) / 1000000;
     buyVolume = Math.min(buyVolume, config.MAX_ORDER_BTC);
     buyVolume = Math.max(buyVolume, 0);
 
-    sellVolume = Math.floor(state.btcBalance * 0.95 * 100000000) / 100000000;
+    sellVolume = Math.floor(state.btcBalance * 0.95 * 1000000) / 1000000;
     sellVolume = Math.min(sellVolume, config.MAX_ORDER_BTC);
     sellVolume = Math.max(sellVolume, 0);
   }
