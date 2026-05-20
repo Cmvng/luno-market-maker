@@ -61,18 +61,27 @@ async function selectBestPair() {
   log(`USDT spread: ${usdtSpread ? `₦${usdtSpread.spreadNgn.toFixed(4)} (${usdtSpread.spreadPct.toFixed(4)}%)` : 'unavailable'}`);
   log(`BTC spread:  ${btcSpread ? `₦${btcSpread.spreadNgn.toLocaleString()} (${btcSpread.spreadPct.toFixed(4)}%)` : 'unavailable'}`);
 
-  // Prefer USDT if spread is acceptable
-  if (usdtSpread && usdtSpread.spreadPct >= config.USDT_MIN_SPREAD_PCT) {
+  // NEVER switch away from USDT if we're holding USDT that needs selling
+  if (state.usdtBalance > 10) {
+    return { pair: config.PRIMARY_PAIR, spread: usdtSpread || { bestBid: 1385, bestAsk: 1387, midPrice: 1386, spreadNgn: 2, spreadPct: 0.14, bidVolume: 0, askVolume: 0 } };
+  }
+
+  // NEVER switch away from BTC if we're holding BTC that needs selling
+  if (state.btcBalance > 0.0001) {
+    return { pair: config.SECONDARY_PAIR, spread: btcSpread || { bestBid: 106000000, bestAsk: 107000000, midPrice: 106500000, spreadNgn: 1000000, spreadPct: 0.94, bidVolume: 0, askVolume: 0 } };
+  }
+
+  // If no inventory, pick best spread
+  if (usdtSpread) {
     return { pair: config.PRIMARY_PAIR, spread: usdtSpread };
   }
 
-  // Fall back to BTC if its spread is good enough
   if (btcSpread && btcSpread.spreadPct >= config.BTC_MIN_SPREAD_PCT) {
     return { pair: config.SECONDARY_PAIR, spread: btcSpread };
   }
 
-  // Neither pair is worth trading
-  return null;
+  // Default to USDT
+  return { pair: config.PRIMARY_PAIR, spread: usdtSpread || { bestBid: 1385, bestAsk: 1387, midPrice: 1386, spreadNgn: 2, spreadPct: 0.14, bidVolume: 0, askVolume: 0 } };
 }
 
 // === CORE: UPDATE BALANCES ===
@@ -118,6 +127,7 @@ async function checkOrderFills() {
       const order = await luno.getOrder(state.buyOrderId);
       if (order.state === 'COMPLETE') {
         buyFilled = true;
+        state.lastBuyFillPrice = state.buyOrderPrice; // track for smart sell
         log(`✅ BUY FILLED @ ₦${state.buyOrderPrice}`);
         await telegram.fill('BUY', state.activePair, state.buyOrderPrice, state.buyOrderVolume);
         state.buyOrderId = null;
@@ -183,12 +193,21 @@ async function placeOrders(spread) {
   const tick = isUsdt ? config.PRICE_TICK_USDT : config.PRICE_TICK_BTC;
 
   // === ALWAYS HAVE ORDERS ON THE BOOK ===
-  // No minimum spread gate. If spread is tight, use smaller size.
-  // If a whale sweeps, our order catches it.
 
   // Price: one tick better than best bid/ask
   let buyPrice = spread.bestBid + tick;
   let sellPrice = spread.bestAsk - tick;
+
+  // === SMART SELL: if we bought cheap, undercut everyone ===
+  // If our last buy filled below the current best bid, we can sell at
+  // just above our buy price — guaranteed profit, impossible to undercut
+  if (state.lastBuyFillPrice && state.lastBuyFillPrice > 0 && isUsdt) {
+    const minProfitSell = Math.ceil((state.lastBuyFillPrice + 0.10) * 100) / 100;
+    if (minProfitSell < sellPrice && minProfitSell < spread.bestAsk) {
+      sellPrice = minProfitSell;
+      log(`💡 Smart sell: cost ₦${state.lastBuyFillPrice}, selling @ ₦${sellPrice}`);
+    }
+  }
 
   // Never cross mid
   if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
@@ -379,12 +398,7 @@ async function mainLoop() {
         lastDailyReset = today;
       }
 
-      // === CHECK SLEEP ===
-      if (state.checkSleep()) {
-        log('💤 Sleeping — spreads too tight...');
-        await sleep(10000);
-        continue;
-      }
+      // === NEVER SLEEP — always active ===
 
       // === CHECK DAILY LOSS LIMIT ===
       if (state.isDailyLossLimitHit()) {
@@ -404,24 +418,16 @@ async function mainLoop() {
         continue;
       }
 
-      // === PAIR SELECTION (every 30s) ===
+      // === PAIR SELECTION (every 60s) ===
       if (state.shouldCheckPairSwitch()) {
         state.markPairChecked();
         const best = await selectBestPair();
-
-        if (!best) {
-          log('😴 No pair with sufficient spread. Sleeping...');
-          await cancelAllOrders();
-          state.sleep();
-          continue;
-        }
 
         if (best.pair !== state.activePair) {
           const oldPair = state.activePair;
           await cancelAllOrders();
           state.activePair = best.pair;
-          state.priceHistory = []; // reset price history for new pair
-          await telegram.pairSwitch(oldPair, best.pair, `Spread: ${best.spread.spreadPct.toFixed(4)}%`);
+          state.priceHistory = [];
           log(`🔄 Switched to ${best.pair}`);
         }
       }
