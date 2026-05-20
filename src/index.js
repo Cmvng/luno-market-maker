@@ -186,8 +186,17 @@ async function placeOrders(spread) {
   // === CHECK: is the market spread wide enough to trade? ===
   if (spread.spreadNgn < minSpread) {
     if (!state._lastTightLog || Date.now() - state._lastTightLog > 30000) {
-      log(`⏸ Spread ₦${spread.spreadNgn.toFixed(2)} below minimum ₦${minSpread.toFixed(2)}. Waiting...`);
+      log(`⏸ Spread ₦${spread.spreadNgn.toFixed(2)} too tight. Waiting...`);
       state._lastTightLog = Date.now();
+    }
+    // Cancel existing orders when spread is too tight — don't leave them hanging
+    if (state.sellOrderId) {
+      try { await luno.cancelOrder(state.sellOrderId); } catch(e) {}
+      state.sellOrderId = null;
+    }
+    if (state.buyOrderId) {
+      try { await luno.cancelOrder(state.buyOrderId); } catch(e) {}
+      state.buyOrderId = null;
     }
     return;
   }
@@ -284,16 +293,17 @@ async function refreshOrders(spread) {
   const idealBuy = spread.bestBid + tick;
   const idealSell = spread.bestAsk - tick;
 
-  // AGGRESSIVE: cancel and replace if we're NOT exactly at top of book
-  // Any deviation = instant refresh
-  if (state.buyOrderId && state.buyOrderPrice < idealBuy - 0.001) {
+  // BUY SIDE: aggressive — stay on top of bid
+  if (state.buyOrderId && state.buyOrderPrice < idealBuy - tick) {
     try {
       await luno.cancelOrder(state.buyOrderId);
       state.buyOrderId = null;
     } catch (err) { state.buyOrderId = null; }
   }
 
-  if (state.sellOrderId && state.sellOrderPrice > idealSell + 0.001) {
+  // SELL SIDE: PATIENT — only refresh if price moved more than 0.5 NGN
+  // Don't chase the other bot tick by tick on the sell side
+  if (state.sellOrderId && Math.abs(state.sellOrderPrice - idealSell) > 0.50) {
     try {
       await luno.cancelOrder(state.sellOrderId);
       state.sellOrderId = null;
