@@ -1,5 +1,5 @@
 // src/luno.js — Luno API Client
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+// Using Node 18+ built-in fetch
 
 const BASE_URL = 'https://api.luno.com/api/1';
 
