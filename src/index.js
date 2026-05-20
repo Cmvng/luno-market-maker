@@ -260,13 +260,14 @@ async function placeOrders(spread) {
   // === PLACE BUY ORDER ===
   if (!state.buyOrderId && buyVolume >= minVol) {
     try {
+      log(`DEBUG placing buy: pair=${pair} type=BID vol=${buyVolume} price=${buyPrice}`);
       const res = await luno.createOrder(pair, 'BID', buyVolume, buyPrice, true);
       state.buyOrderId = res.order_id;
       state.buyOrderPrice = buyPrice;
       state.buyOrderVolume = buyVolume;
       log(`📗 BUY placed: ${buyVolume} @ ₦${buyPrice} [${res.order_id}]`);
     } catch (err) {
-      log(`Failed to place buy: ${err.message}`);
+      log(`Failed to place buy: ${err.message} (vol=${buyVolume} price=${buyPrice})`);
       state.consecutiveErrors++;
     }
   }
@@ -274,13 +275,14 @@ async function placeOrders(spread) {
   // === PLACE SELL ORDER ===
   if (!state.sellOrderId && sellVolume >= minVol) {
     try {
+      log(`DEBUG placing sell: pair=${pair} type=ASK vol=${sellVolume} price=${sellPrice}`);
       const res = await luno.createOrder(pair, 'ASK', sellVolume, sellPrice, true);
       state.sellOrderId = res.order_id;
       state.sellOrderPrice = sellPrice;
       state.sellOrderVolume = sellVolume;
       log(`📕 SELL placed: ${sellVolume} @ ₦${sellPrice} [${res.order_id}]`);
     } catch (err) {
-      log(`Failed to place sell: ${err.message}`);
+      log(`Failed to place sell: ${err.message} (vol=${sellVolume} price=${sellPrice})`);
       state.consecutiveErrors++;
     }
   }
