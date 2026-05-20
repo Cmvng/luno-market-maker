@@ -181,122 +181,98 @@ async function placeOrders(spread) {
   const pair = state.activePair;
   const isUsdt = pair === 'USDTNGN';
   const tick = isUsdt ? config.PRICE_TICK_USDT : config.PRICE_TICK_BTC;
-
-  let buyPrice = spread.bestBid + tick; // one tick above best bid
-  let sellPrice = spread.bestAsk - tick; // one tick below best ask
-
-  // === BOT WAR PROTECTION ===
-  const maxBidPrice = spread.midPrice * (1 - config.MAX_BID_DISTANCE_PCT / 100);
-  const minAskPrice = spread.midPrice * (1 + config.MAX_ASK_DISTANCE_PCT / 100);
-
-  // Don't bid too high or ask too low
-  if (buyPrice > spread.midPrice) buyPrice = spread.midPrice - tick;
-  if (sellPrice < spread.midPrice) sellPrice = spread.midPrice + tick;
-
-  // Ensure minimum spread between our buy and sell
-  const ourSpread = sellPrice - buyPrice;
   const minSpread = isUsdt ? config.USDT_MIN_SPREAD_NGN : spread.midPrice * config.BTC_MIN_SPREAD_PCT / 100;
-  if (ourSpread < minSpread) {
-    log(`Spread too tight after adjustments (₦${ourSpread.toFixed(4)}). Skipping.`);
+
+  // === CHECK: is the market spread wide enough to trade? ===
+  if (spread.spreadNgn < minSpread) {
+    if (!state._lastTightLog || Date.now() - state._lastTightLog > 30000) {
+      log(`⏸ Spread ₦${spread.spreadNgn.toFixed(2)} below minimum ₦${minSpread.toFixed(2)}. Waiting...`);
+      state._lastTightLog = Date.now();
+    }
     return;
   }
 
-  // === INVENTORY SKEW ===
-  const skew = state.getInventorySkew();
-  const skewAmount = isUsdt ? config.INVENTORY_SKEW_NGN : spread.midPrice * 0.001;
+  // === CALCULATE PRICES ===
+  let buyPrice = spread.bestBid + tick;
+  let sellPrice = spread.bestAsk - tick;
 
-  if (skew === 'SELL_SKEW') {
-    sellPrice -= skewAmount; // lower sell to exit crypto faster
-  } else if (skew === 'SELL_URGENT') {
-    sellPrice -= skewAmount * 3;
-  } else if (skew === 'BUY_SKEW') {
-    buyPrice += skewAmount; // raise buy to enter crypto faster
-  } else if (skew === 'BUY_URGENT') {
-    buyPrice += skewAmount * 3;
+  // Never cross mid
+  if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
+  if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
+
+  // Final safety
+  if (sellPrice - buyPrice < minSpread) return;
+
+  // === GENTLE INVENTORY SKEW ===
+  const invRatio = state.getInventoryRatio();
+  if (invRatio > config.IMBALANCE_WARN_RATIO) {
+    sellPrice -= config.INVENTORY_SKEW_NGN;
+    if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
+  } else if (invRatio < (1 - config.IMBALANCE_WARN_RATIO)) {
+    buyPrice += config.INVENTORY_SKEW_NGN;
+    if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
   }
 
-  // === CAUTION MODE: widen spread ===
+  // === CAUTION MODE ===
   if (state.state === 'CAUTION') {
-    const widen = isUsdt ? 1.5 : spread.midPrice * 0.003;
-    buyPrice -= widen;
-    sellPrice += widen;
+    buyPrice -= isUsdt ? 1.5 : spread.midPrice * 0.003;
+    sellPrice += isUsdt ? 1.5 : spread.midPrice * 0.003;
   }
 
-  // Round prices appropriately
-  // Luno USDT/NGN accepts 2 decimal places for price and volume
+  // === ROUND ===
   if (isUsdt) {
-    buyPrice = Math.floor(buyPrice * 100) / 100;    // round DOWN for buy
-    sellPrice = Math.ceil(sellPrice * 100) / 100;    // round UP for sell
+    buyPrice = Math.floor(buyPrice * 100) / 100;
+    sellPrice = Math.ceil(sellPrice * 100) / 100;
   } else {
-    buyPrice = Math.floor(buyPrice);                  // whole numbers for BTC/NGN
+    buyPrice = Math.floor(buyPrice);
     sellPrice = Math.ceil(sellPrice);
   }
 
-  // === CALCULATE ORDER SIZE ===
-  // Use only 50% of available balance per side to keep both sides funded
+  // === ORDER SIZE ===
+  const CAP = 0.48;
   let buyVolume, sellVolume;
-  const CAPITAL_PER_SIDE = 0.48; // use 48% of available (leaves room for rounding)
-
   if (isUsdt) {
-    // Buy side: how much USDT can we buy with available NGN?
-    buyVolume = Math.floor((state.ngnBalance * CAPITAL_PER_SIDE / buyPrice) * 100) / 100;
-    buyVolume = Math.min(buyVolume, config.MAX_ORDER_USDT);
-    buyVolume = Math.max(buyVolume, 0);
-
-    // Sell side: how much USDT do we have?
-    sellVolume = Math.floor(state.usdtBalance * CAPITAL_PER_SIDE * 100) / 100;
-    sellVolume = Math.min(sellVolume, config.MAX_ORDER_USDT);
-    sellVolume = Math.max(sellVolume, 0);
+    buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 100) / 100;
+    sellVolume = Math.floor(state.usdtBalance * CAP * 100) / 100;
   } else {
-    // BTC — 6 decimal places for volume
-    buyVolume = Math.floor((state.ngnBalance * CAPITAL_PER_SIDE / buyPrice) * 1000000) / 1000000;
-    buyVolume = Math.min(buyVolume, config.MAX_ORDER_BTC);
-    buyVolume = Math.max(buyVolume, 0);
-
-    sellVolume = Math.floor(state.btcBalance * CAPITAL_PER_SIDE * 1000000) / 1000000;
-    sellVolume = Math.min(sellVolume, config.MAX_ORDER_BTC);
-    sellVolume = Math.max(sellVolume, 0);
+    buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 1000000) / 1000000;
+    sellVolume = Math.floor(state.btcBalance * CAP * 1000000) / 1000000;
   }
-
+  buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_USDT);
+  sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_USDT);
   const minVol = isUsdt ? config.MIN_ORDER_USDT : config.MIN_ORDER_BTC;
 
-  // === INVENTORY PROTECTION: don't buy more if already overloaded ===
-  const invRatio = state.getInventoryRatio();
-  const skipBuy = invRatio > config.IMBALANCE_CRITICAL_RATIO;   // too much crypto, stop buying
-  const skipSell = invRatio < (1 - config.IMBALANCE_CRITICAL_RATIO); // too much NGN, stop selling
+  // === INVENTORY PROTECTION ===
+  const skipBuy = invRatio > config.IMBALANCE_CRITICAL_RATIO;
+  const skipSell = invRatio < (1 - config.IMBALANCE_CRITICAL_RATIO);
 
-  // === PLACE BUY ORDER ===
+  // === PLACE BUY ===
   if (!state.buyOrderId && buyVolume >= minVol && !skipBuy) {
     try {
       const res = await luno.createOrder(pair, 'BID', buyVolume, buyPrice, true);
       state.buyOrderId = res.order_id;
       state.buyOrderPrice = buyPrice;
       state.buyOrderVolume = buyVolume;
-      log(`📗 BUY ${buyVolume} @ ₦${buyPrice} [${res.order_id}]`);
+      log(`📗 BUY ${buyVolume} @ ₦${buyPrice}`);
     } catch (err) {
-      if (!err.message.includes('ErrOrderCanceled')) {
-        log(`Failed buy: ${err.message} (vol=${buyVolume} price=${buyPrice})`);
-        state.consecutiveErrors++;
-      }
+      if (!err.message.includes('ErrOrderCanceled')) state.consecutiveErrors++;
     }
   }
 
-  // === PLACE SELL ORDER ===
+  // === PLACE SELL ===
   if (!state.sellOrderId && sellVolume >= minVol && !skipSell) {
     try {
       const res = await luno.createOrder(pair, 'ASK', sellVolume, sellPrice, true);
       state.sellOrderId = res.order_id;
       state.sellOrderPrice = sellPrice;
       state.sellOrderVolume = sellVolume;
-      log(`📕 SELL ${sellVolume} @ ₦${sellPrice} [${res.order_id}]`);
+      log(`📕 SELL ${sellVolume} @ ₦${sellPrice}`);
     } catch (err) {
-      if (!err.message.includes('ErrOrderCanceled')) {
-        log(`Failed sell: ${err.message} (vol=${sellVolume} price=${sellPrice})`);
-        state.consecutiveErrors++;
-      }
+      if (!err.message.includes('ErrOrderCanceled')) state.consecutiveErrors++;
     }
   }
 }
+
 
 // === CORE: CHECK IF ORDERS NEED REPLACING (stay on top) ===
 
