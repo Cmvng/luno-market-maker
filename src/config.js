@@ -49,7 +49,7 @@ module.exports = {
   MIN_ORDER_BTC: 0.0005,            // min order size (Luno minimum ~0.0005 BTC)
 
   // === TOP OF BOOK ===
-  PRICE_TICK_USDT: 0.0001,          // minimum price increment for USDT/NGN
+  PRICE_TICK_USDT: 0.01,             // minimum price increment for USDT/NGN (2 decimal places)
   PRICE_TICK_BTC: 1,                // minimum price increment for BTC/NGN
   MAX_BID_DISTANCE_PCT: 0.5,        // don't bid more than 0.5% above mid (bot war protection)
   MAX_ASK_DISTANCE_PCT: 0.5,        // don't ask more than 0.5% below mid
