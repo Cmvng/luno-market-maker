@@ -183,44 +183,38 @@ async function placeOrders(spread) {
   const tick = isUsdt ? config.PRICE_TICK_USDT : config.PRICE_TICK_BTC;
   const minSpread = isUsdt ? config.USDT_MIN_SPREAD_NGN : spread.midPrice * config.BTC_MIN_SPREAD_PCT / 100;
 
-  // === CHECK: is the market spread wide enough to trade? ===
-  if (spread.spreadNgn < minSpread) {
-    if (!state._lastTightLog || Date.now() - state._lastTightLog > 30000) {
-      log(`⏸ Spread ₦${spread.spreadNgn.toFixed(2)} too tight. Waiting...`);
-      state._lastTightLog = Date.now();
-    }
-    // Cancel existing orders when spread is too tight — don't leave them hanging
-    if (state.sellOrderId) {
-      try { await luno.cancelOrder(state.sellOrderId); } catch(e) {}
-      state.sellOrderId = null;
-    }
-    if (state.buyOrderId) {
-      try { await luno.cancelOrder(state.buyOrderId); } catch(e) {}
-      state.buyOrderId = null;
-    }
-    return;
-  }
+  // === COMPETITOR-AWARE PRICING ===
+  // Based on observed patterns:
+  // - Other bot's ask floor: ~1386.40 (they won't sell below this)
+  // - Other bot's bid ceiling: ~1386.10 (they won't buy above this)
+  // - Other bot undercuts by 0.16 per cycle until they hit floor
+  //
+  // STRATEGY: Place our orders at THEIR limits
+  // - Our sell sits at their floor — they chase down to us, we're already there
+  // - Our buy sits at their ceiling — we catch fills at the best price they'll allow
 
-  // === CALCULATE PRICES ===
+  // Dynamic pricing: use order book but with competitor floor/ceiling awareness
   let buyPrice = spread.bestBid + tick;
   let sellPrice = spread.bestAsk - tick;
 
-  // Never cross mid
+  // Don't cross mid
   if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
   if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
 
-  // Final safety
-  if (sellPrice - buyPrice < minSpread) return;
-
-  // === GENTLE INVENTORY SKEW ===
-  const invRatio = state.getInventoryRatio();
-  if (invRatio > config.IMBALANCE_WARN_RATIO) {
-    sellPrice -= config.INVENTORY_SKEW_NGN;
-    if (sellPrice <= spread.midPrice) sellPrice = spread.midPrice + tick;
-  } else if (invRatio < (1 - config.IMBALANCE_WARN_RATIO)) {
-    buyPrice += config.INVENTORY_SKEW_NGN;
-    if (buyPrice >= spread.midPrice) buyPrice = spread.midPrice - tick;
+  // === KEY INSIGHT: Don't chase below competitor floor ===
+  // If our sell would go below 1386.40, stay at 1386.40
+  // The other bot will come to us
+  if (isUsdt) {
+    const COMPETITOR_ASK_FLOOR = spread.midPrice - (spread.spreadNgn * 0.15);
+    if (sellPrice < COMPETITOR_ASK_FLOOR) sellPrice = COMPETITOR_ASK_FLOOR;
+    
+    // On buy side, be aggressive up to near mid but not past it
+    const COMPETITOR_BID_CEILING = spread.midPrice + (spread.spreadNgn * 0.15);
+    if (buyPrice > COMPETITOR_BID_CEILING) buyPrice = COMPETITOR_BID_CEILING;
   }
+
+  // Safety: maintain minimum spread between our buy and sell
+  if (sellPrice - buyPrice < minSpread * 0.8) return;
 
   // === CAUTION MODE ===
   if (state.state === 'CAUTION') {
@@ -243,15 +237,18 @@ async function placeOrders(spread) {
   if (isUsdt) {
     buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 100) / 100;
     sellVolume = Math.floor(state.usdtBalance * CAP * 100) / 100;
+    buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_USDT);
+    sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_USDT);
   } else {
     buyVolume = Math.floor((state.ngnBalance * CAP / buyPrice) * 1000000) / 1000000;
     sellVolume = Math.floor(state.btcBalance * CAP * 1000000) / 1000000;
+    buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_BTC);
+    sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_BTC);
   }
-  buyVolume = Math.min(Math.max(buyVolume, 0), config.MAX_ORDER_USDT);
-  sellVolume = Math.min(Math.max(sellVolume, 0), config.MAX_ORDER_USDT);
   const minVol = isUsdt ? config.MIN_ORDER_USDT : config.MIN_ORDER_BTC;
 
   // === INVENTORY PROTECTION ===
+  const invRatio = state.getInventoryRatio();
   const skipBuy = invRatio > config.IMBALANCE_CRITICAL_RATIO;
   const skipSell = invRatio < (1 - config.IMBALANCE_CRITICAL_RATIO);
 
@@ -263,7 +260,7 @@ async function placeOrders(spread) {
       state.buyOrderPrice = buyPrice;
       state.buyOrderVolume = buyVolume;
       state._buyFails = 0;
-      log(`📗 BUY ${buyVolume} @ ₦${buyPrice}`);
+      log('📗 BUY ' + buyVolume + ' @ ₦' + buyPrice);
     } catch (err) {
       if (err.message.includes('ErrOrderCanceled')) {
         state._buyFails = (state._buyFails || 0) + 1;
@@ -286,12 +283,11 @@ async function placeOrders(spread) {
       state.sellOrderPrice = sellPrice;
       state.sellOrderVolume = sellVolume;
       state._sellFails = 0;
-      log(`📕 SELL ${sellVolume} @ ₦${sellPrice}`);
+      log('📕 SELL ' + sellVolume + ' @ ₦' + sellPrice);
     } catch (err) {
       if (err.message.includes('ErrOrderCanceled')) {
         state._sellFails = (state._sellFails || 0) + 1;
         if (state._sellFails >= 3) {
-          // 3 post-only fails = cooldown 10 seconds
           state.sellOrderId = 'COOLDOWN';
           setTimeout(() => { state.sellOrderId = null; }, 10000);
           state._sellFails = 0;
@@ -302,7 +298,6 @@ async function placeOrders(spread) {
     }
   }
 }
-
 
 // === CORE: CHECK IF ORDERS NEED REPLACING (stay on top) ===
 
