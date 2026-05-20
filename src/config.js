@@ -33,7 +33,7 @@ module.exports = {
   TARGET_INVENTORY_RATIO: 0.50,     // 50/50 split target
   IMBALANCE_WARN_RATIO: 0.60,      // start skewing at 60/40
   IMBALANCE_CRITICAL_RATIO: 0.80,  // emergency rebalance at 80/20
-  INVENTORY_SKEW_NGN: 0.50,        // ₦0.50 skew per level for USDT
+  INVENTORY_SKEW_NGN: 0.10,        // ₦0.10 skew per level for USDT (gentle rebalance)
 
   // === RISK MANAGEMENT ===
   MAX_DAILY_LOSS_PCT: 5,            // stop bot if daily loss exceeds 5% of capital
