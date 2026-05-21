@@ -6,9 +6,9 @@ const config = require('./config');
 class LunoStream {
   constructor(pair, onUpdate) {
     this.pair = pair;
-    this.onUpdate = onUpdate; // callback(orderBook, trades)
+    this.onUpdate = onUpdate;
     this.ws = null;
-    this.orderBook = { bids: {}, asks: {} }; // price -> volume
+    this.orderBook = { bids: {}, asks: {} };
     this.sequence = 0;
     this.connected = false;
     this.reconnectDelay = 1000;
@@ -34,8 +34,8 @@ class LunoStream {
       }
     });
 
-    this.ws.on('close', () => {
-      console.log(`[WS] Disconnected from ${this.pair}. Reconnecting in ${this.reconnectDelay}ms...`);
+    this.ws.on('close', (code, reason) => {
+      console.log(`[WS] Disconnected. Code: ${code} Reason: ${reason ? reason.toString() : 'none'}`);
       this.connected = false;
       setTimeout(() => this.connect(), this.reconnectDelay);
       this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
@@ -44,11 +44,17 @@ class LunoStream {
     this.ws.on('error', (err) => {
       console.error(`[WS] Error: ${err.message}`);
     });
+
+    this.ws.on('unexpected-response', (req, res) => {
+      console.error(`[WS] HTTP ${res.statusCode} ${res.statusMessage}`);
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => console.error(`[WS] Body: ${body}`));
+    });
   }
 
   handleMessage(msg) {
     if (msg.asks && msg.bids && msg.sequence) {
-      // Initial snapshot — full order book
       this.orderBook = { bids: {}, asks: {} };
       for (const bid of msg.bids) {
         this.orderBook.bids[bid.id] = { price: parseFloat(bid.price), volume: parseFloat(bid.volume) };
@@ -57,19 +63,17 @@ class LunoStream {
         this.orderBook.asks[ask.id] = { price: parseFloat(ask.price), volume: parseFloat(ask.volume) };
       }
       this.sequence = parseInt(msg.sequence);
-      console.log(`[WS] Snapshot received. ${Object.keys(this.orderBook.bids).length} bids, ${Object.keys(this.orderBook.asks).length} asks`);
+      console.log(`[WS] Snapshot: ${Object.keys(this.orderBook.bids).length} bids, ${Object.keys(this.orderBook.asks).length} asks`);
       this.emitUpdate([]);
       return;
     }
 
-    // Incremental update
     const seq = parseInt(msg.sequence);
-    if (seq <= this.sequence) return; // stale
+    if (seq <= this.sequence) return;
     this.sequence = seq;
 
     const trades = [];
 
-    // Process trade updates (fills)
     if (msg.trade_updates) {
       for (const t of msg.trade_updates) {
         trades.push({
@@ -81,7 +85,6 @@ class LunoStream {
       }
     }
 
-    // Process create updates (new orders)
     if (msg.create_update) {
       const cu = msg.create_update;
       const side = cu.type === 'BID' ? 'bids' : 'asks';
@@ -91,14 +94,12 @@ class LunoStream {
       };
     }
 
-    // Process delete updates (cancelled/filled orders)
     if (msg.delete_update) {
       const du = msg.delete_update;
       delete this.orderBook.bids[du.order_id];
       delete this.orderBook.asks[du.order_id];
     }
 
-    // Process status update
     if (msg.status_update) {
       console.log(`[WS] Status: ${msg.status_update.status}`);
     }
@@ -113,7 +114,6 @@ class LunoStream {
     }
   }
 
-  // Consolidate order book: group by price, sort
   getConsolidatedBook() {
     const bids = {};
     const asks = {};
@@ -127,7 +127,6 @@ class LunoStream {
       asks[p] = (asks[p] || 0) + order.volume;
     }
 
-    // Sort bids descending, asks ascending
     const sortedBids = Object.entries(bids)
       .map(([p, v]) => ({ price: parseFloat(p), volume: v }))
       .sort((a, b) => b.price - a.price);
