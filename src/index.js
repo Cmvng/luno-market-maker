@@ -200,7 +200,7 @@ async function executeTrade(book) {
       }
       // Refresh sell if outbid (throttled)
       if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
-        if (state.sellOrderPrice > book.bestAsk + 0.005 && now - state._lastSellRefresh > 10000) {
+        if (state.sellOrderPrice > book.bestAsk + 0.005 && now - state._lastSellRefresh > 3000) {
           try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
           state.sellOrderId = null;
           state._lastSellRefresh = now;
@@ -275,7 +275,7 @@ async function executeTrade(book) {
     // Sell side: refresh every 10 seconds if outbid (prevents chase-down)
     //   — when heavy on USDT, refresh every 30 seconds (place and wait)
     //
-    const sellRefreshInterval = 10000;
+    const sellRefreshInterval = 3000;
     const buyRefreshInterval = 3000;
 
     if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
