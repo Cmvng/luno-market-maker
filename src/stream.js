@@ -15,14 +15,18 @@ class LunoStream {
   }
 
   connect() {
-    const url = `wss://${config.LUNO_API_KEY}:${config.LUNO_API_SECRET}@ws.luno.com/api/1/stream/${this.pair}`;
-
-    this.ws = new WebSocket(url);
+    this.ws = new WebSocket('wss://ws.luno.com/api/1/stream/' + this.pair);
 
     this.ws.on('open', () => {
       console.log(`[WS] Connected to ${this.pair}`);
       this.connected = true;
       this.reconnectDelay = 1000;
+      // Send credentials as JSON message — this is how Luno authenticates websockets
+      this.ws.send(JSON.stringify({
+        api_key_id: config.LUNO_API_KEY,
+        api_key_secret: config.LUNO_API_SECRET,
+      }));
+      console.log('[WS] Credentials sent');
     });
 
     this.ws.on('message', (data) => {
