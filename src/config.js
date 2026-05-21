@@ -31,7 +31,7 @@ module.exports = {
   REBALANCE_SIZE_PCT: 0.80,  // use 80% of heavy side for rebalance
 
   // Smart sell
-  SMART_SELL_MARGIN: 0.10,   // ₦0.10 above cost for guaranteed profit
+  SMART_SELL_MARGIN: 0.01,   // ₦0.01 above cost — competitive at tight spreads
 
   // Competitor tracking
   COMPETITOR_HISTORY_SIZE: 100, // track last 100 price levels
