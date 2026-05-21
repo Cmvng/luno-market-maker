@@ -15,12 +15,9 @@ class LunoStream {
   }
 
   connect() {
-    const url = `${config.WS_URL}/${this.pair}`;
-    const auth = Buffer.from(`${config.LUNO_API_KEY}:${config.LUNO_API_SECRET}`).toString('base64');
+    const url = `wss://${config.LUNO_API_KEY}:${config.LUNO_API_SECRET}@ws.luno.com/api/1/stream/${this.pair}`;
 
-    this.ws = new WebSocket(url, {
-      headers: { 'Authorization': `Basic ${auth}` },
-    });
+    this.ws = new WebSocket(url);
 
     this.ws.on('open', () => {
       console.log(`[WS] Connected to ${this.pair}`);
