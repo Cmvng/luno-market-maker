@@ -28,6 +28,8 @@ const state = {
   _sellCooldownUntil: 0,
   _lastBalanceCheck: 0,
   _lastLogTime: 0,
+  _lastTradeAction: 0,
+  _actionLock: false,
 };
 
 const competitor = new CompetitorTracker();
@@ -50,9 +52,7 @@ async function updateBalances() {
       if (cur === 'USDT') state.usdtBalance = avail;
       if (cur === 'XBT') state.btcBalance = avail;
     }
-  } catch (err) {
-    log(`Balance error: ${err.message}`);
-  }
+  } catch (err) {}
 }
 
 // === CHECK FILLS ===
@@ -79,7 +79,6 @@ async function checkFills() {
         log(`✅ SELL FILLED @ ₦${state.sellOrderPrice}`);
         await telegram.fill('SELL', state.sellOrderPrice, state.sellOrderVolume);
 
-        // Track rotation if we have both buy and sell prices
         if (state.lastBuyFillPrice > 0) {
           const profit = (state.lastSellFillPrice - state.lastBuyFillPrice) * state.sellOrderVolume;
           state.dailyPnl += profit;
@@ -111,15 +110,6 @@ async function cancelAll() {
 async function cancelLeftovers() {
   try {
     const orders = await rest.listOrders('USDTNGN', 'PENDING');
-    if (orders.orders) {
-      for (const o of orders.orders) {
-        await rest.cancelOrder(o.order_id);
-        log(`Cancelled leftover: ${o.order_id}`);
-      }
-    }
-  } catch(e) {}
-  try {
-    const orders = await rest.listOrders('XBTNGN', 'PENDING');
     if (orders.orders) {
       for (const o of orders.orders) {
         await rest.cancelOrder(o.order_id);
@@ -174,18 +164,114 @@ async function placeSell(pair, volume, price) {
   }
 }
 
-// === THE BRAIN — called on EVERY order book update from websocket ===
+// === TRADING LOGIC — throttled, runs max every 500ms ===
+async function executeTrading(book) {
+  const now = Date.now();
+
+  // Throttle: minimum 500ms between trading actions
+  if (now - state._lastTradeAction < 500) return;
+  if (state._actionLock) return;
+
+  state._actionLock = true;
+  state._lastTradeAction = now;
+
+  try {
+    // Balance check (every 5 seconds)
+    if (now - state._lastBalanceCheck > config.BALANCE_CHECK_MS) {
+      await updateBalances();
+      state._lastBalanceCheck = now;
+      await checkFills();
+    }
+
+    // === CALCULATE PRICES ===
+    const tick = config.PRICE_TICK;
+    let buyPrice, sellPrice;
+
+    if (book.spread < tick * 3) {
+      buyPrice = book.bestBid;
+      sellPrice = book.bestAsk;
+    } else {
+      buyPrice = Math.floor((book.bestBid + tick) * 100) / 100;
+      sellPrice = Math.ceil((book.bestAsk - tick) * 100) / 100;
+    }
+
+    // === SMART SELL ===
+    if (state.lastBuyFillPrice > 0) {
+      const smartSell = Math.ceil((state.lastBuyFillPrice + config.SMART_SELL_MARGIN) * 100) / 100;
+      if (smartSell < sellPrice && smartSell < book.bestAsk) {
+        sellPrice = smartSell;
+      }
+    }
+
+    // Safety
+    if (sellPrice <= buyPrice) {
+      buyPrice = Math.floor(book.bestBid * 100) / 100;
+      sellPrice = Math.ceil(book.bestAsk * 100) / 100;
+    }
+
+    // === DYNAMIC SIZING ===
+    const spreadRatio = Math.min(book.spread / config.SPREAD_SCALE, 1.0);
+    const capPct = Math.max(config.MIN_CAPITAL_PCT, config.BASE_CAPITAL_PCT * spreadRatio);
+
+    let buyVol = Math.floor((state.ngnBalance * capPct / buyPrice) * 100) / 100;
+    let sellVol = Math.floor(state.usdtBalance * capPct * 100) / 100;
+    buyVol = Math.min(Math.max(buyVol, 0), config.MAX_ORDER_USDT);
+    sellVol = Math.min(Math.max(sellVol, 0), config.MAX_ORDER_USDT);
+
+    // === REBALANCE ===
+    const totalNgn = state.ngnBalance + (state.usdtBalance * book.midPrice);
+    const invRatio = totalNgn > 0 ? (state.usdtBalance * book.midPrice) / totalNgn : 0.5;
+
+    if (invRatio > config.REBALANCE_THRESHOLD) {
+      sellVol = Math.floor(state.usdtBalance * config.REBALANCE_SIZE_PCT * 100) / 100;
+      sellVol = Math.min(sellVol, config.MAX_ORDER_USDT);
+    } else if (invRatio < (1 - config.REBALANCE_THRESHOLD)) {
+      buyVol = Math.floor((state.ngnBalance * config.REBALANCE_SIZE_PCT / buyPrice) * 100) / 100;
+      buyVol = Math.min(buyVol, config.MAX_ORDER_USDT);
+    }
+
+    // === REFRESH: only cancel if we're NOT on top ===
+    if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
+      if (state.buyOrderPrice < buyPrice - 0.005) {
+        try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
+        state.buyOrderId = null;
+      }
+    }
+
+    if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
+      if (state.sellOrderPrice > sellPrice + 0.005) {
+        const stillProfit = !state.lastBuyFillPrice || sellPrice > state.lastBuyFillPrice + 0.05;
+        if (stillProfit) {
+          try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
+          state.sellOrderId = null;
+        }
+      }
+    }
+
+    // === PLACE ORDERS ===
+    if (buyVol >= config.MIN_ORDER_USDT) {
+      await placeBuy('USDTNGN', buyVol, buyPrice);
+    }
+    if (sellVol >= config.MIN_ORDER_USDT) {
+      await placeSell('USDTNGN', sellVol, sellPrice);
+    }
+
+  } finally {
+    state._actionLock = false;
+  }
+}
+
+// === THE BRAIN — called on EVERY websocket update ===
 async function onBookUpdate(book, trades) {
   if (!isRunning) return;
   lastBook = book;
 
-  // Track competitor behavior
+  // Track competitor (instant — no REST calls)
   competitor.update(book);
 
-  // Check for fills from trade updates
+  // Quick fill check from trade updates (no REST call)
   for (const t of trades) {
     if (state.buyOrderId && (t.makerOrderId === state.buyOrderId || t.takerOrderId === state.buyOrderId)) {
-      // Our buy was involved in a trade — check fill status
       await checkFills();
     }
     if (state.sellOrderId && (t.makerOrderId === state.sellOrderId || t.takerOrderId === state.sellOrderId)) {
@@ -193,97 +279,15 @@ async function onBookUpdate(book, trades) {
     }
   }
 
-  // Balance check (throttled)
+  // Execute trading logic (throttled to every 500ms)
+  await executeTrading(book);
+
+  // Log (every 10 seconds)
   const now = Date.now();
-  if (now - state._lastBalanceCheck > config.BALANCE_CHECK_MS) {
-    await updateBalances();
-    state._lastBalanceCheck = now;
-
-    // Also check fills via REST (backup)
-    await checkFills();
-  }
-
-  // === CALCULATE PRICES ===
-  const tick = config.PRICE_TICK;
-  let buyPrice, sellPrice;
-
-  if (book.spread < tick * 3) {
-    // Ultra-tight spread — sit at best bid/ask
-    buyPrice = book.bestBid;
-    sellPrice = book.bestAsk;
-  } else {
-    // Normal — one tick better
-    buyPrice = Math.floor((book.bestBid + tick) * 100) / 100;
-    sellPrice = Math.ceil((book.bestAsk - tick) * 100) / 100;
-  }
-
-  // === SMART SELL — undercut everyone if we bought cheap ===
-  if (state.lastBuyFillPrice > 0) {
-    const smartSell = Math.ceil((state.lastBuyFillPrice + config.SMART_SELL_MARGIN) * 100) / 100;
-    if (smartSell < sellPrice && smartSell < book.bestAsk) {
-      sellPrice = smartSell;
-    }
-  }
-
-  // Safety: sell must be above buy
-  if (sellPrice <= buyPrice) {
-    buyPrice = Math.floor(book.bestBid * 100) / 100;
-    sellPrice = Math.ceil(book.bestAsk * 100) / 100;
-  }
-
-  // === DYNAMIC SIZING ===
-  const spreadRatio = Math.min(book.spread / config.SPREAD_SCALE, 1.0);
-  const capPct = Math.max(config.MIN_CAPITAL_PCT, config.BASE_CAPITAL_PCT * spreadRatio);
-
-  let buyVol = Math.floor((state.ngnBalance * capPct / buyPrice) * 100) / 100;
-  let sellVol = Math.floor(state.usdtBalance * capPct * 100) / 100;
-  buyVol = Math.min(Math.max(buyVol, 0), config.MAX_ORDER_USDT);
-  sellVol = Math.min(Math.max(sellVol, 0), config.MAX_ORDER_USDT);
-
-  // === REBALANCE: when heavy, use bigger orders on heavy side ===
-  const totalNgn = state.ngnBalance + (state.usdtBalance * book.midPrice);
-  const invRatio = totalNgn > 0 ? (state.usdtBalance * book.midPrice) / totalNgn : 0.5;
-
-  if (invRatio > config.REBALANCE_THRESHOLD) {
-    // Heavy on USDT — big sell
-    sellVol = Math.floor(state.usdtBalance * config.REBALANCE_SIZE_PCT * 100) / 100;
-    sellVol = Math.min(sellVol, config.MAX_ORDER_USDT);
-  } else if (invRatio < (1 - config.REBALANCE_THRESHOLD)) {
-    // Heavy on NGN — big buy
-    buyVol = Math.floor((state.ngnBalance * config.REBALANCE_SIZE_PCT / buyPrice) * 100) / 100;
-    buyVol = Math.min(buyVol, config.MAX_ORDER_USDT);
-  }
-
-  // === REFRESH: if our orders aren't at top, cancel and replace ===
-  if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
-    if (state.buyOrderPrice < buyPrice - 0.005) {
-      try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
-      state.buyOrderId = null;
-    }
-  }
-
-  if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
-    if (state.sellOrderPrice > sellPrice + 0.005) {
-      // Only refresh sell if new price is still profitable
-      const stillProfit = !state.lastBuyFillPrice || sellPrice > state.lastBuyFillPrice + 0.05;
-      if (stillProfit) {
-        try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
-        state.sellOrderId = null;
-      }
-    }
-  }
-
-  // === PLACE ORDERS ===
-  if (buyVol >= config.MIN_ORDER_USDT) {
-    await placeBuy('USDTNGN', buyVol, buyPrice);
-  }
-  if (sellVol >= config.MIN_ORDER_USDT) {
-    await placeSell('USDTNGN', sellVol, sellPrice);
-  }
-
-  // === LOG (throttled) ===
   if (now - state._lastLogTime > 10000) {
     state._lastLogTime = now;
+    const totalNgn = state.ngnBalance + (state.usdtBalance * book.midPrice);
+    const invRatio = totalNgn > 0 ? (state.usdtBalance * book.midPrice) / totalNgn : 0.5;
     const comp = competitor.getStats();
     log(
       `${config.PRIMARY_PAIR} | Spread: ₦${book.spread.toFixed(2)} | ` +
@@ -305,21 +309,17 @@ async function main() {
   await telegram.startup();
   log('🚀 V2 Bot starting — Websocket mode');
 
-  // Cancel leftovers
   log('Cancelling leftover orders...');
   await cancelLeftovers();
   await new Promise(r => setTimeout(r, 2000));
 
-  // Initial balances
   await updateBalances();
   state.startingCapital = state.ngnBalance + (state.usdtBalance * 1387);
   log(`Capital: ₦${state.startingCapital.toFixed(0)} | NGN: ₦${state.ngnBalance.toFixed(2)} | USDT: ${state.usdtBalance.toFixed(2)}`);
 
-  // Start websocket stream
   const stream = new LunoStream(config.PRIMARY_PAIR, onBookUpdate);
   stream.connect();
 
-  // Health check server
   const PORT = process.env.PORT || 3000;
   http.createServer((req, res) => {
     res.writeHead(200);
@@ -327,7 +327,6 @@ async function main() {
       status: 'running',
       version: 'v2-websocket',
       spread: lastBook ? lastBook.spread.toFixed(2) : 'N/A',
-      inventory: lastBook ? ((state.usdtBalance * lastBook.midPrice) / (state.ngnBalance + state.usdtBalance * lastBook.midPrice) * 100).toFixed(0) + '%' : 'N/A',
       pnl: state.dailyPnl.toFixed(2),
       rotations: state.dailyRotations,
       competitor: competitor.getStats(),
@@ -335,7 +334,6 @@ async function main() {
   }).listen(PORT, () => log(`Health check on port ${PORT}`));
 }
 
-// Graceful shutdown
 async function shutdown(signal) {
   log(`${signal} — shutting down...`);
   isRunning = false;
