@@ -183,14 +183,27 @@ async function executeTrade(book) {
     // === TRAILING STOP ===
     if (checkStop(book.midPrice)) { await emergencySell(book); return; }
 
-    // === NEGATIVE SPREAD — stop buying but KEEP SELLING if we have USDT ===
+    // === NEGATIVE SPREAD — likely stale websocket data ===
     if (book.spread <= 0) {
-      // Cancel buy — never buy into negative spread
+      // Track how long spread has been negative
+      if (!state._negSince) state._negSince = now;
+
+      // Cancel buy
       if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
         try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
         state.buyOrderId = null;
       }
-      // But if we have USDT to sell, place sell at bestAsk to stay in queue
+
+      // If negative for 30+ seconds, the websocket is stale — reconnect
+      if (now - state._negSince > 30000 && global._stream) {
+        log('🔄 Spread negative for 30s — reconnecting websocket...');
+        state._negSince = null;
+        global._stream.close();
+        // The auto-reconnect in stream.js will get a fresh snapshot
+        return;
+      }
+
+      // Sell USDT if we have any
       if (state.usdtBalance > 10 && !state.sellOrderId) {
         const sellVol = Math.floor(state.usdtBalance * 0.99 * 100) / 100;
         const sellPrice = Math.ceil(book.bestAsk * 100) / 100;
@@ -198,7 +211,6 @@ async function executeTrade(book) {
           await placeSell('USDTNGN', sellVol, sellPrice);
         }
       }
-      // Refresh sell if outbid (throttled)
       if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
         if (state.sellOrderPrice > book.bestAsk + 0.005 && now - state._lastSellRefresh > 3000) {
           try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
@@ -208,6 +220,8 @@ async function executeTrade(book) {
       }
       return;
     }
+    // Spread is positive — reset negative timer
+    state._negSince = null;
 
     // === CALCULATE PRICES ===
     const tick = config.PRICE_TICK;
@@ -353,6 +367,7 @@ async function main() {
   log(`Capital:₦${state.startingCapital.toFixed(0)} NGN:₦${state.ngnBalance.toFixed(2)} USDT:${state.usdtBalance.toFixed(2)}`);
 
   const stream = new LunoStream(config.PRIMARY_PAIR, onBookUpdate);
+  global._stream = stream;
   stream.connect();
 
   const PORT = process.env.PORT || 3000;
