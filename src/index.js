@@ -183,11 +183,28 @@ async function executeTrade(book) {
     // === TRAILING STOP ===
     if (checkStop(book.midPrice)) { await emergencySell(book); return; }
 
-    // === NEGATIVE SPREAD — stop all trading ===
+    // === NEGATIVE SPREAD — stop buying but KEEP SELLING if we have USDT ===
     if (book.spread <= 0) {
+      // Cancel buy — never buy into negative spread
       if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
         try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
         state.buyOrderId = null;
+      }
+      // But if we have USDT to sell, place sell at bestAsk to stay in queue
+      if (state.usdtBalance > 10 && !state.sellOrderId) {
+        const sellVol = Math.floor(state.usdtBalance * 0.99 * 100) / 100;
+        const sellPrice = Math.ceil(book.bestAsk * 100) / 100;
+        if (sellVol >= config.MIN_ORDER_USDT) {
+          await placeSell('USDTNGN', sellVol, sellPrice);
+        }
+      }
+      // Refresh sell if outbid (throttled)
+      if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
+        if (state.sellOrderPrice > book.bestAsk + 0.005 && now - state._lastSellRefresh > 10000) {
+          try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
+          state.sellOrderId = null;
+          state._lastSellRefresh = now;
+        }
       }
       return;
     }
@@ -218,40 +235,35 @@ async function executeTrade(book) {
     const tot = state.ngnBalance + state.usdtBalance * book.midPrice;
     const inv = tot > 0 ? (state.usdtBalance * book.midPrice) / tot : 0.5;
 
-    // === ORDER SIZING ===
+    // === ORDER SIZING — SIMPLE AND AGGRESSIVE ===
     //
-    // RULE 1: Sell side scales up when heavy on USDT (up to 90%)
-    // RULE 2: Buy side NEVER exceeds 50% — prevents buying back what we just sold
-    // RULE 3: When >80% USDT, completely stop buying
-    // RULE 4: When >70% USDT, buy only 15% (small buys to stay on book)
+    // Heavy on USDT? Sell ALL of it. Don't keep scraps.
+    // Heavy on NGN? Buy with 70%. Keep 30% for the sell side.
+    // Balanced? Both sides 50%.
     //
     let bv = 0;
     let sv = 0;
 
-    if (inv > 0.80) {
-      // VERY HEAVY USDT — sell everything, don't buy
-      sv = Math.floor(state.usdtBalance * 0.90 * 100) / 100;
+    if (inv > 0.65) {
+      // HEAVY USDT — sell EVERYTHING, stop buying
+      sv = Math.floor(state.usdtBalance * 0.99 * 100) / 100;
       bv = 0;
-    } else if (inv > 0.70) {
-      // HEAVY USDT — big sell, tiny buy
-      sv = Math.floor(state.usdtBalance * 0.80 * 100) / 100;
-      bv = Math.floor((state.ngnBalance * 0.15 / bp) * 100) / 100;
     } else if (inv > 0.55) {
-      // SLIGHTLY HEAVY USDT — sell more, buy less
-      sv = Math.floor(state.usdtBalance * 0.60 * 100) / 100;
+      // SLIGHTLY HEAVY — sell more, buy less
+      sv = Math.floor(state.usdtBalance * 0.70 * 100) / 100;
       bv = Math.floor((state.ngnBalance * 0.30 / bp) * 100) / 100;
     } else if (inv > 0.45) {
-      // BALANCED — equal both sides
-      sv = Math.floor(state.usdtBalance * 0.45 * 100) / 100;
-      bv = Math.floor((state.ngnBalance * 0.45 / bp) * 100) / 100;
-    } else if (inv > 0.30) {
-      // SLIGHTLY HEAVY NGN — buy more, sell less
+      // BALANCED
+      sv = Math.floor(state.usdtBalance * 0.50 * 100) / 100;
+      bv = Math.floor((state.ngnBalance * 0.50 / bp) * 100) / 100;
+    } else if (inv > 0.35) {
+      // SLIGHTLY HEAVY NGN — buy more
       sv = Math.floor(state.usdtBalance * 0.30 * 100) / 100;
-      bv = Math.floor((state.ngnBalance * 0.50 / bp) * 100) / 100;
+      bv = Math.floor((state.ngnBalance * 0.70 / bp) * 100) / 100;
     } else {
-      // VERY HEAVY NGN — big buy, small sell
-      sv = Math.floor(state.usdtBalance * 0.15 * 100) / 100;
-      bv = Math.floor((state.ngnBalance * 0.50 / bp) * 100) / 100;
+      // HEAVY NGN — buy big, sell whatever is left
+      sv = Math.floor(state.usdtBalance * 0.99 * 100) / 100;
+      bv = Math.floor((state.ngnBalance * 0.70 / bp) * 100) / 100;
     }
 
     bv = Math.min(Math.max(bv, 0), config.MAX_ORDER_USDT);
@@ -263,7 +275,7 @@ async function executeTrade(book) {
     // Sell side: refresh every 10 seconds if outbid (prevents chase-down)
     //   — when heavy on USDT, refresh every 30 seconds (place and wait)
     //
-    const sellRefreshInterval = inv > 0.70 ? 30000 : 10000;
+    const sellRefreshInterval = 10000;
     const buyRefreshInterval = 3000;
 
     if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
