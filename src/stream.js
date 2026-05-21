@@ -1,5 +1,4 @@
 // src/stream.js — Luno Websocket Streaming API
-// Real-time order book updates in milliseconds
 const WebSocket = require('ws');
 const config = require('./config');
 
@@ -15,14 +14,18 @@ class LunoStream {
   }
 
   connect() {
-    const url = `wss://${config.LUNO_API_KEY}:${config.LUNO_API_SECRET}@ws.luno.com/api/1/stream/${this.pair}`;
-
-    this.ws = new WebSocket(url);
+    this.ws = new WebSocket('wss://ws.luno.com/api/1/stream/' + this.pair);
 
     this.ws.on('open', () => {
       console.log(`[WS] Connected to ${this.pair}`);
       this.connected = true;
       this.reconnectDelay = 1000;
+      // Send credentials as first message
+      this.ws.send(JSON.stringify({
+        api_key_id: config.LUNO_API_KEY,
+        api_key_secret: config.LUNO_API_SECRET,
+      }));
+      console.log('[WS] Credentials sent');
     });
 
     this.ws.on('message', (data) => {
