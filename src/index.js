@@ -1,4 +1,4 @@
-// src/index.js — V2 Market Maker Engine (Websocket) — FIXED
+// src/index.js — V2 Market Maker Engine (Websocket) — WITH TRAILING STOP
 const { LunoStream } = require('./stream');
 const { CompetitorTracker } = require('./competitor');
 const rest = require('./rest');
@@ -18,6 +18,7 @@ const state = {
   buyOrderVolume: 0,
   sellOrderVolume: 0,
   lastBuyFillPrice: 0,
+  lastBuyFillTime: 0,
   lastSellFillPrice: 0,
   dailyPnl: 0,
   dailyRotations: 0,
@@ -30,6 +31,17 @@ const state = {
   _lastLogTime: 0,
   _lastTradeAction: 0,
   _actionLock: false,
+  // Trailing stop
+  _priceHistory: [],        // { time, midPrice }
+  _stopLossTriggered: false,
+};
+
+// Trailing stop config
+const STOP_LOSS = {
+  MAX_LOSS_PER_USDT: 1.00,       // absolute max loss — sell if price drops ₦1.00 below cost
+  FAST_DUMP_DROP: 0.50,           // ₦0.50 drop
+  FAST_DUMP_WINDOW_MS: 300000,    // in 5 minutes = fast dump, sell immediately
+  PRICE_HISTORY_MS: 600000,       // track last 10 minutes of prices
 };
 
 const competitor = new CompetitorTracker();
@@ -55,6 +67,75 @@ async function updateBalances() {
   } catch (err) {}
 }
 
+// === TRAILING STOP — should we cut our loss? ===
+function checkTrailingStop(currentMid) {
+  const now = Date.now();
+
+  // Track price history
+  state._priceHistory.push({ time: now, price: currentMid });
+  // Trim old entries
+  state._priceHistory = state._priceHistory.filter(p => now - p.time < STOP_LOSS.PRICE_HISTORY_MS);
+
+  // Only check if we have a buy position to protect
+  if (state.lastBuyFillPrice <= 0 || state.usdtBalance < 5) return false;
+
+  const costBasis = state.lastBuyFillPrice;
+  const currentLoss = costBasis - currentMid;
+
+  // Check 1: absolute max loss
+  if (currentLoss >= STOP_LOSS.MAX_LOSS_PER_USDT) {
+    log(`🛑 STOP LOSS: price ₦${currentMid.toFixed(2)} is ₦${currentLoss.toFixed(2)} below cost ₦${costBasis.toFixed(2)} — MAX LOSS HIT`);
+    return true;
+  }
+
+  // Check 2: fast dump detection
+  const fiveMinAgo = state._priceHistory.find(p => now - p.time >= STOP_LOSS.FAST_DUMP_WINDOW_MS - 10000);
+  if (fiveMinAgo) {
+    const recentDrop = fiveMinAgo.price - currentMid;
+    if (recentDrop >= STOP_LOSS.FAST_DUMP_DROP && currentLoss > 0) {
+      log(`🛑 STOP LOSS: fast dump detected — dropped ₦${recentDrop.toFixed(2)} in 5min, cost ₦${costBasis.toFixed(2)}, now ₦${currentMid.toFixed(2)}`);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// === EMERGENCY SELL — sell USDT at best ask to cut loss ===
+async function emergencySell(book) {
+  if (state.usdtBalance < 5) return;
+
+  // Cancel any existing sell order
+  if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
+    try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
+    state.sellOrderId = null;
+  }
+  // Cancel buy order too — don't buy more during a dump
+  if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
+    try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
+    state.buyOrderId = null;
+  }
+
+  const sellVol = Math.floor(state.usdtBalance * 0.95 * 100) / 100;
+  const sellPrice = Math.floor(book.bestBid * 100) / 100; // sell at best bid for instant fill
+
+  if (sellVol >= 5) {
+    try {
+      const res = await rest.createOrder('USDTNGN', 'ASK', sellVol, sellPrice, false); // NOT post-only
+      log(`🚨 EMERGENCY SELL ${sellVol} @ ₦${sellPrice} — cutting loss`);
+      state.sellOrderId = null;
+      state.lastBuyFillPrice = 0; // reset cost basis
+      state._stopLossTriggered = true;
+      // Cooldown 60 seconds after stop loss before resuming
+      state._buyCooldownUntil = Date.now() + 60000;
+      state._sellCooldownUntil = Date.now() + 60000;
+      await updateBalances();
+    } catch (err) {
+      log(`Emergency sell failed: ${err.message}`);
+    }
+  }
+}
+
 // === CHECK FILLS ===
 async function checkFills() {
   if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
@@ -62,9 +143,10 @@ async function checkFills() {
       const order = await rest.getOrder(state.buyOrderId);
       if (order.state === 'COMPLETE') {
         state.lastBuyFillPrice = state.buyOrderPrice;
+        state.lastBuyFillTime = Date.now();
+        state._stopLossTriggered = false; // reset stop loss for new position
         log(`✅ BUY FILLED @ ₦${state.buyOrderPrice}`);
         state.buyOrderId = null;
-        // Immediately update balances so sell side knows we have USDT
         await updateBalances();
       } else if (order.state === 'CANCELLED' || order.state === 'EXPIRED') {
         state.buyOrderId = null;
@@ -86,7 +168,7 @@ async function checkFills() {
           log(`🔄 ROTATION #${state.dailyRotations} | Profit: ₦${profit.toFixed(2)} | Total: ₦${state.dailyPnl.toFixed(2)}`);
         }
         state.sellOrderId = null;
-        // Immediately update balances so buy side knows we have NGN
+        state.lastBuyFillPrice = 0; // reset — this rotation is done
         await updateBalances();
       } else if (order.state === 'CANCELLED' || order.state === 'EXPIRED') {
         state.sellOrderId = null;
@@ -165,7 +247,7 @@ async function placeSell(pair, volume, price) {
   }
 }
 
-// === TRADING LOGIC — throttled, runs max every 500ms ===
+// === TRADING LOGIC — throttled ===
 async function executeTrading(book) {
   const now = Date.now();
 
@@ -183,9 +265,14 @@ async function executeTrading(book) {
       await checkFills();
     }
 
+    // === TRAILING STOP CHECK ===
+    if (checkTrailingStop(book.midPrice)) {
+      await emergencySell(book);
+      return;
+    }
+
     // === BLOCK TRADING IF SPREAD IS NEGATIVE OR ZERO ===
     if (book.spread <= 0) {
-      // Inverted book — cancel everything and wait
       if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
         try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
         state.buyOrderId = null;
@@ -208,48 +295,39 @@ async function executeTrading(book) {
     // === SMART SELL — never sell below cost ===
     if (state.lastBuyFillPrice > 0) {
       const minSellPrice = Math.ceil((state.lastBuyFillPrice + config.SMART_SELL_MARGIN) * 100) / 100;
-      // Never sell below cost + margin, no matter what
       if (sellPrice < minSellPrice) {
         sellPrice = minSellPrice;
       }
     }
 
-    // === SAFETY: sell must be above buy ===
-    if (sellPrice <= buyPrice) {
-      // Don't trade — spread is too tight for profit
-      return;
-    }
+    // === SAFETY ===
+    if (sellPrice <= buyPrice) return;
 
-    // Round to 2 decimals
     buyPrice = Math.floor(buyPrice * 100) / 100;
     sellPrice = Math.ceil(sellPrice * 100) / 100;
 
-    // === CAPITAL UTILIZATION — use MORE capital ===
-    // Base: 48% of available balance per side
-    // When spread is wider, go up to 70%
+    // === CAPITAL UTILIZATION — 35% to 70% ===
     const spreadRatio = Math.min(book.spread / config.SPREAD_SCALE, 1.0);
-    const capPct = Math.max(0.35, 0.70 * spreadRatio); // minimum 35%, max 70%
+    const capPct = Math.max(0.35, 0.70 * spreadRatio);
 
     let buyVol = Math.floor((state.ngnBalance * capPct / buyPrice) * 100) / 100;
     let sellVol = Math.floor(state.usdtBalance * capPct * 100) / 100;
     buyVol = Math.min(Math.max(buyVol, 0), config.MAX_ORDER_USDT);
     sellVol = Math.min(Math.max(sellVol, 0), config.MAX_ORDER_USDT);
 
-    // === REBALANCE when heavy on one side ===
+    // === REBALANCE ===
     const totalNgn = state.ngnBalance + (state.usdtBalance * book.midPrice);
     const invRatio = totalNgn > 0 ? (state.usdtBalance * book.midPrice) / totalNgn : 0.5;
 
     if (invRatio > config.REBALANCE_THRESHOLD) {
-      // Heavy on USDT — sell MORE
       sellVol = Math.floor(state.usdtBalance * 0.80 * 100) / 100;
       sellVol = Math.min(sellVol, config.MAX_ORDER_USDT);
     } else if (invRatio < (1 - config.REBALANCE_THRESHOLD)) {
-      // Heavy on NGN — buy MORE
       buyVol = Math.floor((state.ngnBalance * 0.80 / buyPrice) * 100) / 100;
       buyVol = Math.min(buyVol, config.MAX_ORDER_USDT);
     }
 
-    // === REFRESH: cancel if not on top ===
+    // === REFRESH ===
     if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN') {
       if (state.buyOrderPrice < buyPrice - 0.005) {
         try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
@@ -259,7 +337,6 @@ async function executeTrading(book) {
 
     if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
       if (state.sellOrderPrice > sellPrice + 0.005) {
-        // Only refresh if still profitable
         const minSell = state.lastBuyFillPrice > 0 ? state.lastBuyFillPrice + config.SMART_SELL_MARGIN : 0;
         if (sellPrice >= minSell) {
           try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
@@ -268,7 +345,7 @@ async function executeTrading(book) {
       }
     }
 
-    // === PLACE BOTH SIDES — always try to have both on book ===
+    // === PLACE ORDERS ===
     if (buyVol >= config.MIN_ORDER_USDT) {
       await placeBuy('USDTNGN', buyVol, buyPrice);
     }
@@ -281,15 +358,13 @@ async function executeTrading(book) {
   }
 }
 
-// === THE BRAIN — called on EVERY websocket update ===
+// === THE BRAIN ===
 async function onBookUpdate(book, trades) {
   if (!isRunning) return;
   lastBook = book;
 
-  // Track competitor (instant)
   competitor.update(book);
 
-  // Quick fill check from trade updates
   for (const t of trades) {
     if (state.buyOrderId && (t.makerOrderId === state.buyOrderId || t.takerOrderId === state.buyOrderId)) {
       await checkFills();
@@ -299,23 +374,22 @@ async function onBookUpdate(book, trades) {
     }
   }
 
-  // Execute trading logic (throttled)
   await executeTrading(book);
 
-  // Log (every 10 seconds)
+  // Log
   const now = Date.now();
   if (now - state._lastLogTime > 10000) {
     state._lastLogTime = now;
     const totalNgn = state.ngnBalance + (state.usdtBalance * book.midPrice);
     const invRatio = totalNgn > 0 ? (state.usdtBalance * book.midPrice) / totalNgn : 0.5;
     const comp = competitor.getStats();
+    const costInfo = state.lastBuyFillPrice > 0 ? ` Cost: ₦${state.lastBuyFillPrice.toFixed(2)}` : '';
     log(
       `${config.PRIMARY_PAIR} | Spread: ₦${book.spread.toFixed(2)} | ` +
       `Inv: ${(invRatio * 100).toFixed(0)}% | ` +
       `P&L: ₦${state.dailyPnl.toFixed(2)} | Rot: ${state.dailyRotations} | ` +
       `Buy: ${state.buyOrderId ? '✅' : '❌'} Sell: ${state.sellOrderId ? '✅' : '❌'} | ` +
-      `NGN: ₦${state.ngnBalance.toFixed(0)} USDT: ${state.usdtBalance.toFixed(1)} | ` +
-      `Floor: ₦${comp.askFloor} Ceil: ₦${comp.bidCeiling}`
+      `NGN: ₦${state.ngnBalance.toFixed(0)} USDT: ${state.usdtBalance.toFixed(1)}${costInfo}`
     );
   }
 }
@@ -328,7 +402,7 @@ async function main() {
   }
 
   await telegram.startup();
-  log('🚀 V2 Bot starting — Websocket mode');
+  log('🚀 V2 Bot starting — Websocket + Trailing Stop');
 
   log('Cancelling leftover orders...');
   await cancelLeftovers();
@@ -346,10 +420,11 @@ async function main() {
     res.writeHead(200);
     res.end(JSON.stringify({
       status: 'running',
-      version: 'v2-websocket',
+      version: 'v2-trailing-stop',
       spread: lastBook ? lastBook.spread.toFixed(2) : 'N/A',
       pnl: state.dailyPnl.toFixed(2),
       rotations: state.dailyRotations,
+      costBasis: state.lastBuyFillPrice,
       competitor: competitor.getStats(),
     }));
   }).listen(PORT, () => log(`Health check on port ${PORT}`));
