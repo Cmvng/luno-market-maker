@@ -20,7 +20,7 @@ module.exports = {
   BTC_PRICE_TICK: 1,       // BTC/NGN minimum increment
 
   // Sizing — dynamic based on spread
-  MAX_ORDER_USDT: 100,
+  MAX_ORDER_USDT: 500,
   MIN_ORDER_USDT: 5,
   BASE_CAPITAL_PCT: 0.48,  // use 48% per side when spread is wide
   MIN_CAPITAL_PCT: 0.15,   // use 15% per side when spread is tight
