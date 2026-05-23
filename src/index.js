@@ -23,7 +23,7 @@ const state = {
   _lastBal: 0, _lastLog: 0, _lastAct: 0, _lock: false,
   _prices: [], _negSince: null,
   _lastSellRefresh: 0, _lastBuyRefresh: 0,
-  _lastCleanup: 0, // periodic cleanup timer
+  _lastCleanup: 0, _sellPlacedAt: 0,
 };
 
 const competitor = new CompetitorTracker();
@@ -165,7 +165,7 @@ async function placeSell(pair, vol, price) {
     state.sellOrderId=r.order_id; state.sellOrderPrice=price; state.sellOrderVolume=vol; state._sellFails=0;
     log(`📕 SELL ${vol} @ ₦${price}`);
   } catch(e) {
-    if (e.message.includes('ErrOrderCanceled')) { state._sellFails++; if(state._sellFails>=5){state._sellCooldown=Date.now()+5000;state._sellFails=0;} }
+    if (e.message.includes('ErrOrderCanceled')) { state._sellFails++; if(state._sellFails>=3){state._sellCooldown=Date.now()+10000;state._sellFails=0;} }
   }
 }
 
@@ -237,19 +237,47 @@ async function executeTrade(book) {
     }
     state._negSince = null;
 
-    // === PRICES ===
-    const tick = config.PRICE_TICK;
-    let bp, sp;
-    if (book.spread < tick * 3) { bp = book.bestBid; sp = book.bestAsk; }
-    else { bp = Math.floor((book.bestBid + tick)*100)/100; sp = Math.ceil((book.bestAsk - tick)*100)/100; }
+    // === SELL STRATEGY: PLACE AND WAIT ===
+    //
+    // 1. Calculate sell price ONCE — close to bid where competitors won't go
+    // 2. Place sell and LOCK for 60 seconds — no cancel, no replace
+    // 3. After lock expires, only adjust if price moved ₦0.50+
+    // 4. Post-only rejection → 10 second cooldown
+    //
 
+    const tick = config.PRICE_TICK;
+
+    // === BUY PRICE — aggressive, one tick above best bid ===
+    let bp;
+    if (book.spread < tick * 3) { bp = book.bestBid; }
+    else { bp = Math.floor((book.bestBid + tick) * 100) / 100; }
+    bp = Math.floor(bp * 100) / 100;
+
+    // === SELL PRICE — place near the bid, where competitors won't go ===
+    // Strategy: bestBid + small margin. Not bestAsk - tick.
+    // This puts us at the bottom of the ask side where no one wants to compete.
+    let sp;
+    const comp = competitor.getStats();
+    const compFloor = parseFloat(comp.askFloor) || 0;
+
+    if (compFloor > 0 && compFloor > book.bestBid + tick) {
+      // Competitor floor is known — place AT their floor
+      sp = Math.ceil(compFloor * 100) / 100;
+    } else if (book.spread > 0.50) {
+      // Wide spread — place in the lower third of the spread
+      sp = Math.ceil((book.bestBid + book.spread * 0.3) * 100) / 100;
+    } else {
+      // Tight spread — place at bestAsk
+      sp = book.bestAsk;
+    }
+
+    // Smart sell — never below cost + margin
     if (state.lastBuyFillPrice > 0) {
-      const min = Math.ceil((state.lastBuyFillPrice + config.SMART_SELL_MARGIN)*100)/100;
-      if (sp < min) sp = min;
+      const minSell = Math.ceil((state.lastBuyFillPrice + config.SMART_SELL_MARGIN) * 100) / 100;
+      if (sp < minSell) sp = minSell;
     }
     if (sp <= bp) return;
-    bp = Math.floor(bp*100)/100;
-    sp = Math.ceil(sp*100)/100;
+    sp = Math.ceil(sp * 100) / 100;
 
     // === INVENTORY ===
     const tot = state.ngnBalance + state.usdtBalance * book.midPrice;
@@ -276,20 +304,47 @@ async function executeTrade(book) {
     bv = Math.min(Math.max(bv, 0), config.MAX_ORDER_USDT);
     sv2 = Math.min(Math.max(sv2, 0), config.MAX_ORDER_USDT);
 
-    // === REFRESH ===
-    const sellRI = 3000, buyRI = 3000;
-    if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN' && state.buyOrderPrice < bp - 0.005 && now - state._lastBuyRefresh > buyRI) {
+    // === BUY REFRESH — every 3 seconds if outbid ===
+    const now2 = Date.now();
+    if (state.buyOrderId && state.buyOrderId !== 'COOLDOWN' && state.buyOrderPrice < bp - 0.005 && now2 - state._lastBuyRefresh > 3000) {
       try { await rest.cancelOrder(state.buyOrderId); } catch(e) {}
-      state.buyOrderId = null; state._lastBuyRefresh = now;
-    }
-    if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN' && state.sellOrderPrice > sp + 0.005 && now - state._lastSellRefresh > sellRI) {
-      const ok = !state.lastBuyFillPrice || sp > state.lastBuyFillPrice + config.SMART_SELL_MARGIN - 0.005;
-      if (ok) { try { await rest.cancelOrder(state.sellOrderId); } catch(e) {} state.sellOrderId = null; state._lastSellRefresh = now; }
+      state.buyOrderId = null; state._lastBuyRefresh = now2;
     }
 
-    // === PLACE ===
+    // === SELL: PLACE AND WAIT — 60 SECOND LOCK ===
+    if (state.sellOrderId && state.sellOrderId !== 'COOLDOWN') {
+      // Sell is placed — check if lock has expired
+      const sellAge = now2 - (state._sellPlacedAt || 0);
+
+      if (sellAge < 60000) {
+        // LOCKED — do nothing, let it sit in the queue
+        // No cancel, no refresh, no matter what
+      } else {
+        // Lock expired — only refresh if price moved significantly (₦0.50+)
+        const drift = Math.abs(state.sellOrderPrice - sp);
+        if (drift > 0.50) {
+          const ok = !state.lastBuyFillPrice || sp > state.lastBuyFillPrice + config.SMART_SELL_MARGIN - 0.005;
+          if (ok) {
+            log('🔄 Sell lock expired, price drifted ₦' + drift.toFixed(2) + ' — replacing');
+            try { await rest.cancelOrder(state.sellOrderId); } catch(e) {}
+            state.sellOrderId = null;
+          }
+        }
+        // If drift < ₦0.50, extend the lock — leave it alone
+      }
+    }
+
+    // === PLACE ORDERS ===
     if (bv >= config.MIN_ORDER_USDT) await placeBuy('USDTNGN', bv, bp);
-    if (sv2 >= config.MIN_ORDER_USDT) await placeSell('USDTNGN', sv2, sp);
+    if (sv2 >= config.MIN_ORDER_USDT) {
+      if (!state.sellOrderId) {
+        await placeSell('USDTNGN', sv2, sp);
+        if (state.sellOrderId) {
+          state._sellPlacedAt = now2;
+          // Don't set _lastSellRefresh — use _sellPlacedAt for the lock
+        }
+      }
+    }
 
   } finally { state._lock = false; }
 }
