@@ -1,49 +1,39 @@
-// src/config.js — V2 Configuration
+// config.js — Triangle bot settings
 module.exports = {
   LUNO_API_KEY: process.env.LUNO_API_KEY_ID || '',
   LUNO_API_SECRET: process.env.LUNO_API_SECRET || '',
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
-  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
+
+  // Capital split
+  ROUTE1_PCT: 0.65,   // USDC/NGN spread route
+  ROUTE2_PCT: 0.35,   // USDC/USDT stablecoin route
 
   // Pairs
-  PRIMARY_PAIR: 'USDTNGN',
-  SECONDARY_PAIR: 'XBTNGN',
+  PAIR_USDC_NGN: 'USDCNGN',
+  PAIR_USDT_NGN: 'USDTNGN',
+  PAIR_USDC_USDT: 'USDCUSDT',
 
-  // Websocket
-  WS_URL: 'wss://ws.luno.com/api/1/stream',
+  // ROUTE 1 rules
+  R1_MIN_GAP: 10,          // only trade USDC/NGN when ask-bid > ₦10
+  R1_BUY_TICK: 0.01,       // buy at best bid + ₦0.01
+  R1_SELL_BELOW_USDT: 3,   // sell USDC at ₦3 below USDT price (range 2-5)
+  R1_SELL_BELOW_MIN: 2,    // closest to USDT price
+  R1_SELL_BELOW_MAX: 5,    // furthest from USDT price
 
-  // Order placement (REST)
-  REST_URL: 'https://api.luno.com/api/1',
+  // ROUTE 2 rules
+  R2_USDC_BUY: 0.98005,    // buy USDC with USDT at this price
+  R2_USDC_CEILING: 0.9990, // never pay more than this for USDC
+  R2_SELL_BELOW_USDT: 3,   // sell USDC at ₦3 below USDT price
 
-  // Pricing
-  PRICE_TICK: 0.01,        // USDT/NGN minimum increment
-  BTC_PRICE_TICK: 1,       // BTC/NGN minimum increment
+  // Order sizing
+  MIN_ORDER_USDC: 5,       // Luno minimum
+  MAX_ORDER_USDC: 500,
 
-  // Sizing — dynamic based on spread
-  MAX_ORDER_USDT: 500,
-  MIN_ORDER_USDT: 5,
-  BASE_CAPITAL_PCT: 0.48,  // use 48% per side when spread is wide
-  MIN_CAPITAL_PCT: 0.15,   // use 15% per side when spread is tight
-  SPREAD_SCALE: 2.0,       // spread at which we use full BASE_CAPITAL_PCT
-
-  // Rebalance
-  REBALANCE_THRESHOLD: 0.70, // trigger big order when one side > 70%
-  REBALANCE_SIZE_PCT: 0.80,  // use 80% of heavy side for rebalance
-
-  // Smart sell
-  SMART_SELL_MARGIN: 0.01,   // ₦0.01 above cost — competitive at tight spreads
-
-  // Competitor tracking
-  COMPETITOR_HISTORY_SIZE: 100, // track last 100 price levels
-  COMPETITOR_FLOOR_PERCENTILE: 0.10, // bottom 10% of asks = their floor
-
-  // Risk
-  MAX_DAILY_LOSS_PCT: 5,
-
-  // Post-only cooldown
-  POST_ONLY_FAIL_LIMIT: 5,
-  POST_ONLY_COOLDOWN_MS: 5000,
-
-  // Balance check interval
+  // Timing
   BALANCE_CHECK_MS: 5000,
+  ACTION_THROTTLE_MS: 500,
+  BUY_REFRESH_MS: 3000,    // re-top buy every 3s if outbid
+  SELL_WAIT_MS: 60000,     // let sell sit 60s before adjusting
+
+  PRICE_DECIMALS_NGN: 2,   // Luno wants 2 decimals for NGN pairs
+  PRICE_DECIMALS_USDT: 5,  // USDC/USDT uses more decimals
 };
