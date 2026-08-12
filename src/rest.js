@@ -1,47 +1,48 @@
-// src/rest.js — Luno REST API (orders + balances only)
+// rest.js — Luno REST API (orders + balances)
 const config = require('./config');
+const BASE = 'https://api.luno.com/api/1';
 
-const BASE = config.REST_URL;
-
-function authHeader() {
+function auth() {
   return 'Basic ' + Buffer.from(`${config.LUNO_API_KEY}:${config.LUNO_API_SECRET}`).toString('base64');
 }
 
-async function request(method, path, params = {}) {
-  let url = `${BASE}${path}`;
-  const opts = {
+async function call(method, path, params) {
+  const url = new URL(BASE + path);
+  let body;
+  if (params && method === 'GET') {
+    Object.keys(params).forEach(k => url.searchParams.append(k, params[k]));
+  } else if (params) {
+    body = new URLSearchParams(params).toString();
+  }
+  const res = await fetch(url.toString(), {
     method,
     headers: {
-      'Authorization': authHeader(),
-      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': auth(),
+      ...(body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
     },
-  };
-
-  if (method === 'GET' && Object.keys(params).length > 0) {
-    url += '?' + new URLSearchParams(params).toString();
-  } else if (method === 'POST') {
-    opts.body = new URLSearchParams(params).toString();
-  }
-
-  const res = await fetch(url, opts);
-  const data = await res.json();
-  if (data.error_code || data.error) {
-    throw new Error(`${data.error_code || 'ERR'}: ${data.error || data.error_code}`);
+    ...(body ? { body } : {}),
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok || data.error) {
+    throw new Error(data.error || `HTTP ${res.status}: ${text}`);
   }
   return data;
 }
 
 module.exports = {
-  getBalances: () => request('GET', '/balance'),
-  listOrders: (pair, state = 'PENDING') => request('GET', '/listorders', { pair, state }),
-  getOrder: (id) => request('GET', `/orders/${id}`),
-  createOrder: (pair, type, volume, price, postOnly = true) =>
-    request('POST', '/postorder', {
-      pair,
-      type,
-      volume: volume.toString(),
-      price: price.toString(),
+  getBalances: () => call('GET', '/balance'),
+  getTicker: (pair) => call('GET', '/ticker', { pair }),
+  getOrderBook: (pair) => call('GET', '/orderbook_top', { pair }),
+  listOrders: (pair, state) => call('GET', '/listorders', state ? { pair, state } : { pair }),
+  getOrder: (id) => call('GET', '/orders/' + id),
+  createOrder: (pair, type, volume, price, postOnly) =>
+    call('POST', '/postorder', {
+      pair, type,
+      volume: String(volume),
+      price: String(price),
       ...(postOnly ? { post_only: 'true' } : {}),
     }),
-  cancelOrder: (id) => request('POST', '/stoporder', { order_id: id }),
+  cancelOrder: (id) => call('POST', '/stoporder', { order_id: id }),
 };
