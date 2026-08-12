@@ -1,15 +1,7 @@
 {
-  "name": "luno-market-maker-v2",
-  "version": "2.0.0",
-  "description": "Luno USDT/NGN market maker with websocket streaming",
+  "name": "luno-triangle-bot",
+  "version": "1.0.0",
   "main": "src/index.js",
-  "scripts": {
-    "start": "node src/index.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "dependencies": {
-    "ws": "^8.17.0"
-  }
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": { "ws": "^8.17.0" }
 }
