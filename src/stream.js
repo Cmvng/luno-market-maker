@@ -1,188 +1,93 @@
-// src/stream.js — Luno Websocket Streaming API
-// Real-time order book updates in milliseconds
+// stream.js — Luno websocket for one pair's order book
 const WebSocket = require('ws');
 const config = require('./config');
 
-class LunoStream {
+class Stream {
   constructor(pair, onUpdate) {
     this.pair = pair;
-    this.onUpdate = onUpdate; // callback(orderBook, trades)
+    this.onUpdate = onUpdate;
     this.ws = null;
-    this.orderBook = { bids: {}, asks: {} }; // price -> volume
-    this.sequence = 0;
+    this.book = { bids: {}, asks: {} };
+    this.seq = 0;
     this.connected = false;
-    this.reconnectDelay = 1000;
+    this.delay = 1000;
   }
 
   connect() {
     this.ws = new WebSocket('wss://ws.luno.com/api/1/stream/' + this.pair);
 
     this.ws.on('open', () => {
-      console.log(`[WS] Connected to ${this.pair}`);
       this.connected = true;
-      this.reconnectDelay = 1000;
-      // Send credentials as JSON message — this is how Luno authenticates websockets
+      this.delay = 1000;
       this.ws.send(JSON.stringify({
         api_key_id: config.LUNO_API_KEY,
         api_key_secret: config.LUNO_API_SECRET,
       }));
-      console.log('[WS] Credentials sent');
+      console.log(`[WS ${this.pair}] connected`);
     });
 
     this.ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        this.handleMessage(msg);
-      } catch (err) {
-        console.error('[WS] Parse error:', err.message);
-      }
+      try { this.handle(JSON.parse(data.toString())); }
+      catch (e) { console.error(`[WS ${this.pair}] parse err`, e.message); }
     });
 
-    this.ws.on('close', (code, reason) => {
-      console.log(`[WS] Disconnected from ${this.pair}. Code: ${code} Reason: ${reason ? reason.toString() : 'none'}. Reconnecting in ${this.reconnectDelay}ms...`);
+    this.ws.on('close', () => {
       this.connected = false;
-      setTimeout(() => this.connect(), this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
+      setTimeout(() => this.connect(), this.delay);
+      this.delay = Math.min(this.delay * 2, 30000);
     });
 
-    this.ws.on('error', (err) => {
-      console.error(`[WS] Error: ${err.message}`);
-    });
-
-    // Log unexpected close after open
-    this.ws.on('unexpected-response', (req, res) => {
-      console.error(`[WS] Unexpected response: ${res.statusCode} ${res.statusMessage}`);
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => console.error(`[WS] Response body: ${body}`));
-    });
+    this.ws.on('error', (e) => console.error(`[WS ${this.pair}] err`, e.message));
   }
 
-  handleMessage(msg) {
+  handle(msg) {
+    // Snapshot
     if (msg.asks && msg.bids && msg.sequence) {
-      // Initial snapshot — full order book
-      this.orderBook = { bids: {}, asks: {} };
-      for (const bid of msg.bids) {
-        this.orderBook.bids[bid.id] = { price: parseFloat(bid.price), volume: parseFloat(bid.volume) };
-      }
-      for (const ask of msg.asks) {
-        this.orderBook.asks[ask.id] = { price: parseFloat(ask.price), volume: parseFloat(ask.volume) };
-      }
-      this.sequence = parseInt(msg.sequence);
-      console.log(`[WS] Snapshot received. ${Object.keys(this.orderBook.bids).length} bids, ${Object.keys(this.orderBook.asks).length} asks`);
-      this.emitUpdate([]);
+      this.book = { bids: {}, asks: {} };
+      for (const b of msg.bids) this.book.bids[b.id] = { price: +b.price, vol: +b.volume };
+      for (const a of msg.asks) this.book.asks[a.id] = { price: +a.price, vol: +a.volume };
+      this.seq = +msg.sequence;
+      console.log(`[WS ${this.pair}] snapshot ${msg.bids.length}b/${msg.asks.length}a`);
+      this.emit();
       return;
     }
-
-    // Incremental update
-    const seq = parseInt(msg.sequence);
-    if (seq <= this.sequence) return; // stale
-
-    // Detect sequence gap — if we skipped messages, book is unreliable
-    if (seq > this.sequence + 1 && this.sequence > 0) {
-      console.log(`[WS] Sequence gap: expected ${this.sequence + 1}, got ${seq}. Reconnecting for fresh snapshot...`);
-      this.sequence = 0;
-      this.orderBook = { bids: {}, asks: {} };
+    const seq = +msg.sequence;
+    if (seq <= this.seq) return;
+    // gap -> reconnect for fresh snapshot
+    if (seq > this.seq + 1 && this.seq > 0) {
+      console.log(`[WS ${this.pair}] seq gap, reconnecting`);
+      this.seq = 0; this.book = { bids: {}, asks: {} };
       if (this.ws) this.ws.close();
       return;
     }
-
-    this.sequence = seq;
-
-    const trades = [];
-
-    // Process trade updates (fills)
-    if (msg.trade_updates) {
-      for (const t of msg.trade_updates) {
-        trades.push({
-          base: parseFloat(t.base),
-          counter: parseFloat(t.counter),
-          makerOrderId: t.maker_order_id,
-          takerOrderId: t.taker_order_id,
-        });
-      }
-    }
-
-    // Process create updates (new orders)
+    this.seq = seq;
     if (msg.create_update) {
-      const cu = msg.create_update;
-      const side = cu.type === 'BID' ? 'bids' : 'asks';
-      this.orderBook[side][cu.order_id] = {
-        price: parseFloat(cu.price),
-        volume: parseFloat(cu.volume),
-      };
+      const c = msg.create_update;
+      const side = c.type === 'BID' ? 'bids' : 'asks';
+      this.book[side][c.order_id] = { price: +c.price, vol: +c.volume };
     }
-
-    // Process delete updates (cancelled/filled orders)
     if (msg.delete_update) {
-      const du = msg.delete_update;
-      delete this.orderBook.bids[du.order_id];
-      delete this.orderBook.asks[du.order_id];
+      delete this.book.bids[msg.delete_update.order_id];
+      delete this.book.asks[msg.delete_update.order_id];
     }
-
-    // Process status update
-    if (msg.status_update) {
-      console.log(`[WS] Status: ${msg.status_update.status}`);
-    }
-
-    this.emitUpdate(trades);
+    this.emit();
   }
 
-  emitUpdate(trades) {
-    const book = this.getConsolidatedBook();
-    if (this.onUpdate) {
-      this.onUpdate(book, trades);
-    }
+  emit() {
+    const bids = Object.values(this.book.bids).sort((a, b) => b.price - a.price);
+    const asks = Object.values(this.book.asks).sort((a, b) => a.price - b.price);
+    const bestBid = bids[0] ? bids[0].price : 0;
+    const bestAsk = asks[0] ? asks[0].price : 0;
+    if (this.onUpdate) this.onUpdate({
+      pair: this.pair,
+      bestBid, bestAsk,
+      spread: bestAsk - bestBid,
+      bidVol: bids[0] ? bids[0].vol : 0,
+      askVol: asks[0] ? asks[0].vol : 0,
+    });
   }
 
-  // Consolidate order book: group by price, sort
-  getConsolidatedBook() {
-    const bids = {};
-    const asks = {};
-
-    for (const order of Object.values(this.orderBook.bids)) {
-      const p = order.price;
-      bids[p] = (bids[p] || 0) + order.volume;
-    }
-    for (const order of Object.values(this.orderBook.asks)) {
-      const p = order.price;
-      asks[p] = (asks[p] || 0) + order.volume;
-    }
-
-    // Sort bids descending, asks ascending
-    const sortedBids = Object.entries(bids)
-      .map(([p, v]) => ({ price: parseFloat(p), volume: v }))
-      .sort((a, b) => b.price - a.price);
-
-    const sortedAsks = Object.entries(asks)
-      .map(([p, v]) => ({ price: parseFloat(p), volume: v }))
-      .sort((a, b) => a.price - b.price);
-
-    const bestBid = sortedBids[0] || { price: 0, volume: 0 };
-    const bestAsk = sortedAsks[0] || { price: 999999, volume: 0 };
-    const midPrice = (bestBid.price + bestAsk.price) / 2;
-    const spread = bestAsk.price - bestBid.price;
-
-    return {
-      bids: sortedBids,
-      asks: sortedAsks,
-      bestBid: bestBid.price,
-      bestAsk: bestAsk.price,
-      bestBidVol: bestBid.volume,
-      bestAskVol: bestAsk.volume,
-      midPrice,
-      spread,
-      spreadPct: (spread / midPrice) * 100,
-    };
-  }
-
-  isConnected() {
-    return this.connected && this.sequence > 0;
-  }
-
-  close() {
-    if (this.ws) this.ws.close();
-  }
+  close() { if (this.ws) this.ws.close(); }
 }
 
-module.exports = { LunoStream };
+module.exports = { Stream };
